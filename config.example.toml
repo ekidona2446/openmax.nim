@@ -1,0 +1,41 @@
+[server]
+host = "[::1]"
+dualstack_mode = "auto"
+log_level = "debug"
+
+[tls]
+enabled = true
+cert_file = "certs/cert.pem"
+key_file = "certs/key.pem"
+
+[database]
+kind = "sqlite"
+sqlite_file = "openmax.db"
+mysql_host = "127.0.0.1"
+mysql_port = 3306
+mysql_user = "root"
+mysql_password = "password"
+mysql_database = "openmax"
+
+[service_urls]
+avatar_base_url = "http://127.0.0.1/avatar/"
+origins = ["http://127.0.0.1", "https://web.openmax.su"]
+
+[protocols]
+oneme_tcp_enabled = true
+oneme_tcp_port = 443
+oneme_ws_enabled = true
+oneme_ws_port = 81
+tamtam_tcp_enabled = true
+tamtam_tcp_port = 4433
+tamtam_ws_enabled = true
+tamtam_ws_port = 82
+
+[integrations]
+telegram_enabled = false
+telegram_token = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+telegram_whitelist_enabled = true
+telegram_whitelist_ids = ["1", "2", "3"]
+sms_gateway_url = "http://127.0.0.1:8100/sms-gateway"
+push_firebase_credentials_path = ""
+geoip_db_path = ""
