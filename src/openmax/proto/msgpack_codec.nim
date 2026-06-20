@@ -1,4 +1,6 @@
+import std/json
 import msgpack4nim
+import msgpack4nim/msgpack2json
 
 type
   MsgPackCodecError* = object of CatchableError
@@ -25,6 +27,12 @@ proc unpackMapPayload*[T](data: openArray[byte], _: typedesc[T]): T {.raises: [M
   try:
     var stream = MsgStream.init(bytesToString(data), MSGPACK_OBJ_TO_MAP)
     result = stream.unpack(T)
+  except Exception as exc:
+    raise newException(MsgPackCodecError, exc.msg)
+
+proc packJsonPayload*(value: JsonNode): seq[byte] {.raises: [MsgPackCodecError].} =
+  try:
+    stringToBytes(fromJsonNode(value))
   except Exception as exc:
     raise newException(MsgPackCodecError, exc.msg)
 

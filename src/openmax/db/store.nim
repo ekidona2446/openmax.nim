@@ -75,6 +75,9 @@ proc close*(db: AppDatabase) =
 proc rowLen*(row: DbRow): int =
   row.len
 
+proc dbRowString(row: DbRow, key: string): string =
+  row.getOrDefault(key, "")
+
 proc findUserByPhone*(db: AppDatabase, phone: string): DbRow =
   db.sqlite.queryRow(
     "SELECT * FROM users WHERE phone = ? LIMIT 1",
@@ -196,6 +199,95 @@ proc createOnemeUser*(db: AppDatabase,
   db.insertUserData(phone)
   db.insertDefaultFolder(phone)
   db.findUserById(userId)
+
+proc nextMessageId*(db: AppDatabase): int64 =
+  let row = db.sqlite.queryRow("SELECT COALESCE(MAX(id), 0) AS id FROM messages")
+  dbRowString(row, "id").parseBiggestInt().int64 + 1
+
+proc findChatById*(db: AppDatabase, chatId: int64): DbRow =
+  db.sqlite.queryRow(
+    "SELECT * FROM chats WHERE id = ? LIMIT 1",
+    [intValue(chatId)]
+  )
+
+proc participantsOfChat*(db: AppDatabase, chatId: int64): seq[int64] =
+  for row in db.sqlite.queryAll(
+    "SELECT user_id FROM chat_participants WHERE chat_id = ? ORDER BY user_id",
+    [intValue(chatId)]
+  ):
+    result.add dbRowString(row, "user_id").parseBiggestInt().int64
+
+proc ensureChat*(db: AppDatabase,
+                 chatId, owner: int64,
+                 kind: string,
+                 participants: openArray[int64]) =
+  if db.findChatById(chatId).len == 0:
+    db.sqlite.exec(
+      "INSERT INTO chats (id, owner, type) VALUES (?, ?, ?)",
+      [intValue(chatId), intValue(owner), textValue(kind)]
+    )
+
+  for userId in participants:
+    db.sqlite.exec(
+      "INSERT OR IGNORE INTO chat_participants (chat_id, user_id) VALUES (?, ?)",
+      [intValue(chatId), intValue(userId)]
+    )
+
+proc chatsForUser*(db: AppDatabase, userId: int64): seq[DbRow] =
+  db.sqlite.queryAll(
+    """
+    SELECT c.* FROM chats c
+      JOIN chat_participants cp ON cp.chat_id = c.id
+    WHERE cp.user_id = ?
+    ORDER BY c.id DESC
+    """,
+    [intValue(userId)]
+  )
+
+proc lastMessageForChat*(db: AppDatabase, chatId: int64): DbRow =
+  db.sqlite.queryRow(
+    "SELECT * FROM messages WHERE chat_id = ? ORDER BY CAST(time AS INTEGER) DESC, id DESC LIMIT 1",
+    [intValue(chatId)]
+  )
+
+proc messagesForChat*(db: AppDatabase, chatId: int64, limit: int): seq[DbRow] =
+  db.sqlite.queryAll(
+    "SELECT * FROM messages WHERE chat_id = ? ORDER BY CAST(time AS INTEGER) DESC, id DESC LIMIT ?",
+    [intValue(chatId), intValue(limit.int64)]
+  )
+
+proc messagesByIds*(db: AppDatabase, chatId: int64, ids: openArray[int64]): seq[DbRow] =
+  for id in ids:
+    let row = db.sqlite.queryRow(
+      "SELECT * FROM messages WHERE chat_id = ? AND id = ? LIMIT 1",
+      [intValue(chatId), intValue(id)]
+    )
+    if row.len != 0:
+      result.add row
+
+proc insertMessage*(db: AppDatabase,
+                    chatId, sender, cid: int64,
+                    text, attachesJson, elementsJson, kind: string,
+                    createdAtMs: int64): DbRow =
+  let id = db.nextMessageId()
+  db.sqlite.exec(
+    """
+    INSERT INTO messages (id, chat_id, sender, time, text, attaches, cid, elements, type)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """,
+    [
+      intValue(id),
+      intValue(chatId),
+      intValue(sender),
+      textValue($createdAtMs),
+      textValue(text),
+      textValue(attachesJson),
+      textValue($cid),
+      textValue(elementsJson),
+      textValue(kind)
+    ]
+  )
+  db.sqlite.queryRow("SELECT * FROM messages WHERE id = ? LIMIT 1", [intValue(id)])
 
 proc createTamtamUser*(db: AppDatabase,
                        phone, name: string): DbRow =

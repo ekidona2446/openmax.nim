@@ -1,10 +1,11 @@
-import std/[logging, strformat, strutils, tables]
+import std/[logging, strformat, strutils, tables, json]
 import chronos
 import msgpack4nim
 import ../../core/connection_context
 import ../../core/opcodes
 import ../../crypto/sha256
 import ../../db/store
+import ../../db/sqlite_abi
 import ../../proto/mobile_frame
 import ../../proto/mobile_rpc
 import ../../proto/msgpack_codec
@@ -145,11 +146,192 @@ type
   OnemeCallTokenResponse = object
     token: string
 
+  OnemeReactionInfoPayload = object
+    totalCount: int
+    counters: seq[string]
+
+  OnemeMessagePayload = object
+    id: int64
+    chatId: int64
+    sender: int64
+    text: string
+    time: int64
+    `type`: string
+    cid: int64
+    attaches: seq[string]
+    elements: seq[string]
+    reactionInfo: OnemeReactionInfoPayload
+
+  OnemeSendMessageInner = object
+    text: string
+    cid: int64
+    elements: seq[string]
+    attaches: seq[string]
+
+  OnemeSendMessagePayload = object
+    chatId: int64
+    userId: int64
+    message: OnemeSendMessageInner
+    notify: bool
+
+  OnemeMessagesListResponse = object
+    messages: seq[OnemeMessagePayload]
+
+  OnemeGetMessagesPayload = object
+    chatId: int64
+    messageIds: seq[int64]
+
+  OnemeChatInfoPayload = object
+    chatIds: seq[int64]
+
+  OnemeChatHistoryPayload = object
+    chatId: int64
+    forward: int
+    backward: int
+    backwardTime: int64
+    forwardTime: int64
+    getChat: bool
+    `from`: int64
+    itemType: string
+    getMessages: bool
+    interactive: bool
+
+  OnemeChatPayload = object
+    id: int64
+    `type`: string
+    status: string
+    owner: int64
+    participants: Table[string, int]
+    lastMessage: OnemeMessagePayload
+    lastEventTime: int64
+    lastDelayedUpdateTime: int64
+    lastFireDelayedErrorTime: int64
+    created: int64
+    joinTime: int64
+    modified: int64
+
+  OnemeChatsResponse = object
+    chats: seq[OnemeChatPayload]
+
 proc safeInfo(message: string) =
   try:
     info message
   except Exception:
     discard
+
+proc emptyReactionInfo(): OnemeReactionInfoPayload =
+  OnemeReactionInfoPayload(totalCount: 0, counters: @[])
+
+proc emptyMessage(chatId = 0'i64): OnemeMessagePayload =
+  OnemeMessagePayload(
+    id: 0,
+    chatId: chatId,
+    sender: 0,
+    text: "",
+    time: 0,
+    `type`: "USER",
+    cid: 0,
+    attaches: @[],
+    elements: @[],
+    reactionInfo: emptyReactionInfo()
+  )
+
+proc messageFromRow(row: DbRow): OnemeMessagePayload =
+  if row.len == 0:
+    return emptyMessage()
+
+  OnemeMessagePayload(
+    id: rowInt64(row, "id"),
+    chatId: rowInt64(row, "chat_id"),
+    sender: rowInt64(row, "sender"),
+    text: rowString(row, "text"),
+    time: rowInt64(row, "time"),
+    `type`: rowString(row, "type"),
+    cid: rowInt64(row, "cid"),
+    attaches: @[],
+    elements: @[],
+    reactionInfo: emptyReactionInfo()
+  )
+
+proc participantsTable(ids: openArray[int64]): Table[string, int] =
+  result = initTable[string, int]()
+  for id in ids:
+    result[$id] = 0
+
+proc chatFromRow(ctx: ConnectionContext, row: DbRow): OnemeChatPayload =
+  let chatId = rowInt64(row, "id")
+  let participants = ctx.app.db.participantsOfChat(chatId)
+  let last = messageFromRow(ctx.app.db.lastMessageForChat(chatId))
+  let lastTime = if last.id == 0: 0'i64 else: last.time
+
+  OnemeChatPayload(
+    id: chatId,
+    `type`: rowString(row, "type"),
+    status: "ACTIVE",
+    owner: rowInt64(row, "owner"),
+    participants: participantsTable(participants),
+    lastMessage: if last.id == 0: emptyMessage(chatId) else: last,
+    lastEventTime: lastTime,
+    lastDelayedUpdateTime: 0,
+    lastFireDelayedErrorTime: 0,
+    created: 1,
+    joinTime: 1,
+    modified: lastTime
+  )
+
+proc messageToJson(message: OnemeMessagePayload): JsonNode =
+  %*{
+    "id": message.id,
+    "chatId": message.chatId,
+    "sender": message.sender,
+    "text": message.text,
+    "time": message.time,
+    "type": message.`type`,
+    "cid": message.cid,
+    "attaches": [],
+    "elements": [],
+    "reactionInfo": {
+      "totalCount": 0,
+      "counters": []
+    }
+  }
+
+proc participantsToJson(ids: openArray[int64]): JsonNode =
+  result = newJObject()
+  for id in ids:
+    result[$id] = %0
+
+proc chatToJson(ctx: ConnectionContext, chat: OnemeChatPayload): JsonNode =
+  let participants = ctx.app.db.participantsOfChat(chat.id)
+  %*{
+    "id": chat.id,
+    "type": chat.`type`,
+    "status": chat.status,
+    "owner": chat.owner,
+    "participants": participantsToJson(participants),
+    "lastMessage": messageToJson(chat.lastMessage),
+    "lastEventTime": chat.lastEventTime,
+    "lastDelayedUpdateTime": chat.lastDelayedUpdateTime,
+    "lastFireDelayedErrorTime": chat.lastFireDelayedErrorTime,
+    "created": chat.created,
+    "joinTime": chat.joinTime,
+    "modified": chat.modified
+  }
+
+proc chatsResponseJson(ctx: ConnectionContext, chats: openArray[OnemeChatPayload]): JsonNode =
+  result = newJObject()
+  result["chats"] = newJArray()
+  for chat in chats:
+    result["chats"].add chatToJson(ctx, chat)
+
+proc requireLoggedIn(ctx: ConnectionContext,
+                     transp: StreamTransport,
+                     frame: MobileFrame,
+                     opcode: uint16): Future[bool] {.async.} =
+  if ctx.currentUserId == 0:
+    await transp.sendErrorResponse(frame, opcode, invalidTokenError())
+    return false
+  true
 
 proc validHello(payload: OnemeHelloPayload): bool =
   payload.userAgent.deviceType.len > 0 and
@@ -459,14 +641,142 @@ proc handleFoldersGet(transp: StreamTransport,
     )
   )
 
-proc handleChatsList(transp: StreamTransport,
+proc handleChatsList(ctx: ConnectionContext,
+                     transp: StreamTransport,
                      frame: MobileFrame): Future[void] {.async.} =
-  await transp.sendResponseObject(
-    frame,
-    CmdOk,
-    ChatsListOpcode,
-    OnemeChatsListResponse(chats: @[])
+  if not await requireLoggedIn(ctx, transp, frame, ChatsListOpcode):
+    return
+
+  var chats: seq[OnemeChatPayload] = @[]
+  for row in ctx.app.db.chatsForUser(ctx.currentUserId):
+    chats.add chatFromRow(ctx, row)
+
+  await transp.sendResponseBytes(frame, CmdOk, ChatsListOpcode, packJsonPayload(chatsResponseJson(ctx, chats)))
+
+proc handleChatInfo(ctx: ConnectionContext,
+                    transp: StreamTransport,
+                    frame: MobileFrame): Future[void] {.async.} =
+  if not await requireLoggedIn(ctx, transp, frame, ChatInfoOpcode):
+    return
+
+  let payload =
+    try:
+      unpackMapPayload(frame.payload, OnemeChatInfoPayload)
+    except MsgPackCodecError:
+      # PyMax's ChatInfo payload has chatIds; this fallback keeps old empty payloads harmless.
+      await transp.sendResponseBytes(frame, CmdOk, ChatInfoOpcode, packJsonPayload(chatsResponseJson(ctx, newSeq[OnemeChatPayload]())))
+      return
+
+  var chats: seq[OnemeChatPayload] = @[]
+  for chatId in payload.chatIds:
+    let storageChatId = if chatId == 0: ctx.currentUserId else: chatId
+    let row = ctx.app.db.findChatById(storageChatId)
+    if row.len != 0 and ctx.currentUserId in ctx.app.db.participantsOfChat(storageChatId):
+      chats.add chatFromRow(ctx, row)
+
+  await transp.sendResponseBytes(frame, CmdOk, ChatInfoOpcode, packJsonPayload(chatsResponseJson(ctx, chats)))
+
+proc storageChatIdFor(ctx: ConnectionContext, requestedChatId, userId: int64): int64 =
+  if requestedChatId == 0:
+    ctx.currentUserId
+  elif requestedChatId != 0:
+    requestedChatId
+  elif userId != 0:
+    ctx.currentUserId xor userId
+  else:
+    ctx.currentUserId
+
+proc handleSendMessage(ctx: ConnectionContext,
+                       transp: StreamTransport,
+                       frame: MobileFrame): Future[void] {.async.} =
+  if not await requireLoggedIn(ctx, transp, frame, MsgSendOpcode):
+    return
+
+  let payload =
+    try:
+      unpackMapPayload(frame.payload, OnemeSendMessagePayload)
+    except MsgPackCodecError:
+      await transp.sendErrorResponse(frame, MsgSendOpcode, invalidPayloadError())
+      return
+
+  if payload.message.text.len == 0 and payload.message.attaches.len == 0:
+    await transp.sendErrorResponse(frame, MsgSendOpcode, invalidPayloadError())
+    return
+
+  let chatId = storageChatIdFor(ctx, payload.chatId, payload.userId)
+  if ctx.app.db.findChatById(chatId).len == 0:
+    if chatId == ctx.currentUserId:
+      ctx.app.db.ensureChat(chatId, ctx.currentUserId, "DIALOG", [ctx.currentUserId])
+    elif payload.userId != 0:
+      ctx.app.db.ensureChat(chatId, ctx.currentUserId, "DIALOG", [ctx.currentUserId, payload.userId])
+    else:
+      await transp.sendErrorResponse(frame, MsgSendOpcode, notImplementedError())
+      return
+
+  let participants = ctx.app.db.participantsOfChat(chatId)
+  if ctx.currentUserId notin participants:
+    await transp.sendErrorResponse(frame, MsgSendOpcode, invalidTokenError())
+    return
+
+  let row = ctx.app.db.insertMessage(
+    chatId,
+    ctx.currentUserId,
+    payload.message.cid,
+    payload.message.text,
+    "[]",
+    "[]",
+    "USER",
+    nowUnixMs()
   )
+
+  let response = messageFromRow(row)
+  await transp.sendResponseObject(frame, CmdOk, MsgSendOpcode, response)
+
+proc handleChatHistory(ctx: ConnectionContext,
+                       transp: StreamTransport,
+                       frame: MobileFrame): Future[void] {.async.} =
+  if not await requireLoggedIn(ctx, transp, frame, ChatHistoryOpcode):
+    return
+
+  let payload =
+    try:
+      unpackMapPayload(frame.payload, OnemeChatHistoryPayload)
+    except MsgPackCodecError:
+      await transp.sendErrorResponse(frame, ChatHistoryOpcode, invalidPayloadError())
+      return
+
+  let chatId = if payload.chatId == 0: ctx.currentUserId else: payload.chatId
+  if ctx.app.db.findChatById(chatId).len == 0 or ctx.currentUserId notin ctx.app.db.participantsOfChat(chatId):
+    await transp.sendResponseObject(frame, CmdOk, ChatHistoryOpcode, OnemeMessagesListResponse(messages: @[]))
+    return
+
+  let limit = max(1, max(payload.backward, payload.forward))
+  var messages: seq[OnemeMessagePayload] = @[]
+  for row in ctx.app.db.messagesForChat(chatId, limit):
+    messages.add messageFromRow(row)
+
+  await transp.sendResponseObject(frame, CmdOk, ChatHistoryOpcode, OnemeMessagesListResponse(messages: messages))
+
+proc handleGetMessages(ctx: ConnectionContext,
+                       transp: StreamTransport,
+                       frame: MobileFrame): Future[void] {.async.} =
+  if not await requireLoggedIn(ctx, transp, frame, MsgGetOpcode):
+    return
+
+  let payload =
+    try:
+      unpackMapPayload(frame.payload, OnemeGetMessagesPayload)
+    except MsgPackCodecError:
+      await transp.sendErrorResponse(frame, MsgGetOpcode, invalidPayloadError())
+      return
+
+  let chatId = if payload.chatId == 0: ctx.currentUserId else: payload.chatId
+  var messages: seq[OnemeMessagePayload] = @[]
+  if ctx.currentUserId in ctx.app.db.participantsOfChat(chatId):
+    for row in ctx.app.db.messagesByIds(chatId, payload.messageIds):
+      messages.add messageFromRow(row)
+
+  await transp.sendResponseObject(frame, CmdOk, MsgGetOpcode, OnemeMessagesListResponse(messages: messages))
 
 proc handleCallsToken(ctx: ConnectionContext,
                       transp: StreamTransport,
@@ -506,6 +816,14 @@ proc handleContactInfoByPhone(ctx: ConnectionContext,
     await transp.sendErrorResponse(frame, ContactInfoByPhoneOpcode, userNotFoundError())
     return
 
+  if ctx.currentUserId != 0:
+    let contactId = rowInt64(user, "id")
+    let chatId = if contactId == ctx.currentUserId: ctx.currentUserId else: ctx.currentUserId xor contactId
+    if contactId == ctx.currentUserId:
+      ctx.app.db.ensureChat(chatId, ctx.currentUserId, "DIALOG", [ctx.currentUserId])
+    else:
+      ctx.app.db.ensureChat(chatId, ctx.currentUserId, "DIALOG", [ctx.currentUserId, contactId])
+
   await transp.sendResponseObject(
     frame,
     CmdOk,
@@ -540,7 +858,15 @@ proc handleTcpFrame*(ctx: ConnectionContext,
   of FoldersGetOpcode:
     await handleFoldersGet(transp, frame)
   of ChatsListOpcode:
-    await handleChatsList(transp, frame)
+    await handleChatsList(ctx, transp, frame)
+  of ChatInfoOpcode:
+    await handleChatInfo(ctx, transp, frame)
+  of MsgSendOpcode:
+    await handleSendMessage(ctx, transp, frame)
+  of ChatHistoryOpcode:
+    await handleChatHistory(ctx, transp, frame)
+  of MsgGetOpcode:
+    await handleGetMessages(ctx, transp, frame)
   of ContactInfoByPhoneOpcode:
     await handleContactInfoByPhone(ctx, transp, frame)
   of CallsTokenOpcode:

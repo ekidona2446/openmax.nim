@@ -62,6 +62,13 @@ async def main():
     print("sessions", [s.model_dump() for s in await client.get_sessions()])
     print("folders", (await client.get_folders()).model_dump())
     print("chats", [c.model_dump() for c in await client.fetch_chats()])
+    sent = await client.send_message(0, "hello from pymax probe", notify=False)
+    print("sent", sent.model_dump() if sent else None)
+    history = await client.fetch_history(0, backward=10)
+    print("history", [m.model_dump() for m in history or []])
+    loaded = await client.get_message(0, sent.id) if sent else None
+    print("loaded", loaded.model_dump() if loaded else None)
+    print("chats-after-send", [c.model_dump() for c in await client.fetch_chats()])
     print("self-by-phone", (await client.search_by_phone(args.phone)).model_dump())
     call_token = await client._app.invoke(Opcode.CALLS_TOKEN, {})
     print("call-token", call_token.payload)
