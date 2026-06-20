@@ -3,6 +3,7 @@ import chronos
 import msgpack4nim
 import ../../core/connection_context
 import ../../core/opcodes
+import ../../crypto/sha256
 import ../../db/store
 import ../../proto/mobile_frame
 import ../../proto/mobile_rpc
@@ -98,6 +99,51 @@ type
     token: string
     time: int64
     config: LoginConfigPayload
+
+  OnemeSessionInfo = object
+    id: string
+    deviceId: string
+    current: bool
+    userAgent: string
+    appVersion: string
+    deviceName: string
+    deviceType: string
+    platform: string
+    ip: string
+    location: string
+    created: int64
+    updated: int64
+    lastActivity: int64
+
+  OnemeSessionsInfoResponse = object
+    sessions: seq[OnemeSessionInfo]
+
+  OnemeFolderPayload = object
+    id: string
+    title: string
+    filters: seq[string]
+    updateTime: int64
+    options: seq[string]
+    sourceId: int
+    `include`: seq[int64]
+
+  OnemeFoldersGetResponse = object
+    folderSync: int64
+    folders: seq[OnemeFolderPayload]
+    foldersOrder: seq[string]
+    allFilterExcludeFolders: seq[string]
+
+  OnemeChatsListResponse = object
+    chats: seq[string]
+
+  OnemeContactByPhonePayload = object
+    phone: string
+
+  OnemeContactInfoByPhoneResponse = object
+    contact: OnemeContactProfile
+
+  OnemeCallTokenResponse = object
+    token: string
 
 proc safeInfo(message: string) =
   try:
@@ -218,7 +264,7 @@ proc handleAuth(ctx: ConnectionContext,
     await transp.sendErrorResponse(frame, AuthOpcode, codeExpiredError())
     return
 
-  if rowString(stored, "code_hash") != payload.verifyCode:
+  if rowString(stored, "code_hash") != sha256Hex(payload.verifyCode):
     await transp.sendErrorResponse(frame, AuthOpcode, invalidCodeError())
     return
 
@@ -297,7 +343,9 @@ proc handleAuthConfirm(ctx: ConnectionContext,
   let response = OnemeConfirmRegistrationResponse(
     userToken: userId,
     profile: buildOnemeProfile(user),
-    tokenType: "LOGIN",
+    # PyMax validates this field against AuthType, whose values do not include LOGIN.
+    # The actual login credential is still returned in `token` and is used by the client.
+    tokenType: "REGISTER",
     token: loginToken
   )
 
@@ -329,6 +377,10 @@ proc handleLogin(ctx: ConnectionContext,
     await transp.sendErrorResponse(frame, LoginOpcode, userNotFoundError())
     return
 
+  ctx.currentPhone = phone
+  ctx.currentUserId = rowInt64(user, "id")
+  ctx.currentSessionToken = payload.token
+
   let response = OnemeLoginResponse(
     profile: buildOnemeProfile(user),
     token: payload.token,
@@ -353,6 +405,114 @@ proc handleLog(transp: StreamTransport,
                frame: MobileFrame): Future[void] {.async.} =
   await transp.sendNilResponse(frame, CmdOk, LogOpcode)
 
+proc handleSessionsInfo(ctx: ConnectionContext,
+                        transp: StreamTransport,
+                        frame: MobileFrame): Future[void] {.async.} =
+  let now = nowUnixMs()
+  var sessions: seq[OnemeSessionInfo] = @[]
+
+  if ctx.currentSessionToken.len > 0:
+    sessions.add OnemeSessionInfo(
+      id: ctx.currentSessionToken,
+      deviceId: "",
+      current: true,
+      userAgent: "MAX " & deviceTypeOrDefault(ctx),
+      appVersion: ctx.appVersion,
+      deviceName: deviceNameOrDefault(ctx),
+      deviceType: deviceTypeOrDefault(ctx),
+      platform: deviceTypeOrDefault(ctx),
+      ip: ctx.peer,
+      location: "RU",
+      created: now,
+      updated: now,
+      lastActivity: now
+    )
+
+  await transp.sendResponseObject(
+    frame,
+    CmdOk,
+    SessionsInfoOpcode,
+    OnemeSessionsInfoResponse(sessions: sessions)
+  )
+
+proc handleFoldersGet(transp: StreamTransport,
+                      frame: MobileFrame): Future[void] {.async.} =
+  let allFolder = OnemeFolderPayload(
+    id: "all.chat.folder",
+    title: "Все",
+    filters: @[],
+    updateTime: 0,
+    options: @[],
+    sourceId: 1,
+    `include`: @[]
+  )
+
+  await transp.sendResponseObject(
+    frame,
+    CmdOk,
+    FoldersGetOpcode,
+    OnemeFoldersGetResponse(
+      folderSync: nowUnixMs(),
+      folders: @[allFolder],
+      foldersOrder: @["all.chat.folder"],
+      allFilterExcludeFolders: @[]
+    )
+  )
+
+proc handleChatsList(transp: StreamTransport,
+                     frame: MobileFrame): Future[void] {.async.} =
+  await transp.sendResponseObject(
+    frame,
+    CmdOk,
+    ChatsListOpcode,
+    OnemeChatsListResponse(chats: @[])
+  )
+
+proc handleCallsToken(ctx: ConnectionContext,
+                      transp: StreamTransport,
+                      frame: MobileFrame): Future[void] {.async.} =
+  if ctx.currentUserId == 0:
+    await transp.sendErrorResponse(frame, CallsTokenOpcode, invalidTokenError())
+    return
+
+  # maxcalls documents opcode 158 as CallTokenRequest.  A full Calls API
+  # implementation will validate this token later; for now it encodes enough
+  # local identity for localhost federation experiments.
+  let callToken = "openmax-call:" & $ctx.currentUserId & ":" & generateRandomString(64)
+  await transp.sendResponseObject(
+    frame,
+    CmdOk,
+    CallsTokenOpcode,
+    OnemeCallTokenResponse(token: callToken)
+  )
+
+proc handleContactInfoByPhone(ctx: ConnectionContext,
+                              transp: StreamTransport,
+                              frame: MobileFrame): Future[void] {.async.} =
+  let payload =
+    try:
+      unpackMapPayload(frame.payload, OnemeContactByPhonePayload)
+    except MsgPackCodecError:
+      await transp.sendErrorResponse(frame, ContactInfoByPhoneOpcode, invalidPayloadError())
+      return
+
+  let phone = normalizePhoneNumber(payload.phone)
+  if phone.len == 0:
+    await transp.sendErrorResponse(frame, ContactInfoByPhoneOpcode, invalidPayloadError())
+    return
+
+  let user = ctx.app.db.findUserByPhone(phone)
+  if user.len == 0:
+    await transp.sendErrorResponse(frame, ContactInfoByPhoneOpcode, userNotFoundError())
+    return
+
+  await transp.sendResponseObject(
+    frame,
+    CmdOk,
+    ContactInfoByPhoneOpcode,
+    OnemeContactInfoByPhoneResponse(contact: buildOnemeProfile(user).contact)
+  )
+
 proc handleTcpFrame*(ctx: ConnectionContext,
                      transp: StreamTransport,
                      frame: MobileFrame): Future[void] {.async.} =
@@ -375,5 +535,15 @@ proc handleTcpFrame*(ctx: ConnectionContext,
     await handleAuthConfirm(ctx, transp, frame)
   of LoginOpcode:
     await handleLogin(ctx, transp, frame)
+  of SessionsInfoOpcode:
+    await handleSessionsInfo(ctx, transp, frame)
+  of FoldersGetOpcode:
+    await handleFoldersGet(transp, frame)
+  of ChatsListOpcode:
+    await handleChatsList(transp, frame)
+  of ContactInfoByPhoneOpcode:
+    await handleContactInfoByPhone(ctx, transp, frame)
+  of CallsTokenOpcode:
+    await handleCallsToken(ctx, transp, frame)
   else:
     await transp.sendErrorResponse(frame, frame.header.opcode, notImplementedError())

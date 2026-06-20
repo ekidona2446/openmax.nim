@@ -1,5 +1,6 @@
 import std/[os, strutils, times, random, json, tables]
 import ../config/types
+import ../crypto/sha256
 import ./sqlite_abi
 
 type
@@ -100,8 +101,8 @@ proc insertAuthToken*(db: AppDatabase,
     "INSERT INTO auth_tokens (phone, token_hash, code_hash, expires, state) VALUES (?, ?, ?, ?, ?)",
     [
       textValue(phone),
-      textValue(token),
-      textValue(code),
+      textValue(sha256Hex(token)),
+      textValue(sha256Hex(code)),
       textValue($expires),
       if state.len > 0: textValue(state) else: nullValue()
     ]
@@ -110,19 +111,19 @@ proc insertAuthToken*(db: AppDatabase,
 proc findAuthToken*(db: AppDatabase, token: string): DbRow =
   db.sqlite.queryRow(
     "SELECT * FROM auth_tokens WHERE token_hash = ? AND CAST(expires AS INTEGER) > ? LIMIT 1",
-    [textValue(token), intValue(nowUnix())]
+    [textValue(sha256Hex(token)), intValue(nowUnix())]
   )
 
 proc updateAuthTokenState*(db: AppDatabase, token, state: string) =
   db.sqlite.exec(
     "UPDATE auth_tokens SET state = ? WHERE token_hash = ?",
-    [textValue(state), textValue(token)]
+    [textValue(state), textValue(sha256Hex(token))]
   )
 
 proc deleteAuthToken*(db: AppDatabase, token: string) =
   db.sqlite.exec(
     "DELETE FROM auth_tokens WHERE token_hash = ?",
-    [textValue(token)]
+    [textValue(sha256Hex(token))]
   )
 
 proc insertSessionToken*(db: AppDatabase,
@@ -132,7 +133,7 @@ proc insertSessionToken*(db: AppDatabase,
     "INSERT INTO tokens (phone, token_hash, device_type, device_name, location, time) VALUES (?, ?, ?, ?, ?, ?)",
     [
       textValue(phone),
-      textValue(token),
+      textValue(sha256Hex(token)),
       textValue(deviceType),
       textValue(deviceName),
       textValue(location),
@@ -143,7 +144,7 @@ proc insertSessionToken*(db: AppDatabase,
 proc findSessionToken*(db: AppDatabase, token: string): DbRow =
   db.sqlite.queryRow(
     "SELECT * FROM tokens WHERE token_hash = ? LIMIT 1",
-    [textValue(token)]
+    [textValue(sha256Hex(token))]
   )
 
 proc generateUserId*(db: AppDatabase): int64 =

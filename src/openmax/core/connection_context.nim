@@ -9,6 +9,9 @@ type
     deviceType*: string
     deviceName*: string
     appVersion*: string
+    currentPhone*: string
+    currentUserId*: int64
+    currentSessionToken*: string
 
 proc newConnectionContext*(app: AppContext,
                            protocol: ProtocolKind,
@@ -19,5 +22,8 @@ proc newConnectionContext*(app: AppContext,
     peer: peer,
     deviceType: "",
     deviceName: "",
-    appVersion: ""
+    appVersion: "",
+    currentPhone: "",
+    currentUserId: 0,
+    currentSessionToken: ""
   )

@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import hashlib
 import sqlite3
 import ssl
 from pathlib import Path
@@ -29,7 +30,15 @@ class DbSmsCodeProvider(SmsCodeProvider):
             (phone,),
         ).fetchone()
         conn.close()
-        return row[0] if row else None
+        if not row:
+            return None
+        code_hash = row[0]
+        # OpenMAX stores SHA-256(code), so recover the six-digit dev code by brute force.
+        for value in range(1_000_000):
+            code = f"{value:06d}"
+            if hashlib.sha256(code.encode()).hexdigest() == code_hash:
+                return code
+        return None
 
 
 async def run_client(phone: str, work_dir: str, host: str, port: int, use_ssl: bool,

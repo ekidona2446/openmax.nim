@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import sqlite3
 import ssl
 from pathlib import Path
@@ -30,12 +31,17 @@ def fetch_code(token: str) -> str:
     conn = sqlite3.connect(DB_PATH)
     row = conn.execute(
         "select code_hash from auth_tokens where token_hash = ?",
-        (token,),
+        (hashlib.sha256(token.encode()).hexdigest(),),
     ).fetchone()
     conn.close()
     if not row:
         raise RuntimeError("code not found")
-    return row[0]
+    code_hash = row[0]
+    for value in range(1_000_000):
+        code = f"{value:06d}"
+        if hashlib.sha256(code.encode()).hexdigest() == code_hash:
+            return code
+    raise RuntimeError("code hash not brute-forced")
 
 
 async def main():

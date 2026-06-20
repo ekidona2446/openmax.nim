@@ -3,6 +3,7 @@ import chronos
 import msgpack4nim
 import ../../core/connection_context
 import ../../core/opcodes
+import ../../crypto/sha256
 import ../../db/store
 import ../../proto/mobile_frame
 import ../../proto/mobile_rpc
@@ -225,7 +226,7 @@ proc handleAuth(ctx: ConnectionContext,
     await transp.sendErrorResponse(frame, AuthOpcode, codeExpiredError())
     return
 
-  if rowString(stored, "code_hash") != payload.verifyCode:
+  if rowString(stored, "code_hash") != sha256Hex(payload.verifyCode):
     await transp.sendErrorResponse(frame, AuthOpcode, invalidCodeError())
     return
 
