@@ -21,6 +21,7 @@ const
   ## wolfSSL_get_error values. They match the OpenSSL-compatible WANT codes.
   WolfSslErrorWantRead* = 2.cint
   WolfSslErrorWantWrite* = 3.cint
+  WolfSslErrorZeroReturn* = 6.cint
 
   ## wolfSSL protocol version enum value.
   WolfSslTlsV13* = 4.cint

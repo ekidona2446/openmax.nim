@@ -79,6 +79,10 @@ proc handleTcpClient(runtime: ListenerRuntime,
     safeInfo(&"[transport] tcp client disconnected: {runtime.spec.protocol} {peer}")
   except TransportError as exc:
     safeWarn(&"[transport] tcp client transport error from {peer}: {exc.msg}")
+  except WolfTlsClosedError:
+    safeInfo(&"[transport] tcp tls client disconnected: {runtime.spec.protocol} {peer}")
+  except WolfTlsError as exc:
+    safeWarn(&"[transport] tcp tls error from {peer}: {exc.msg}")
   except AsyncStreamError as exc:
     safeWarn(&"[transport] tcp client stream error from {peer}: {exc.msg}")
   except CancelledError:

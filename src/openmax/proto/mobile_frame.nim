@@ -196,6 +196,8 @@ proc readPlainN(transp: MobileTransport, nbytes: int): Future[seq[byte]] {.
         result[offset + i] = tmp[i]
       offset += rc
     elif rc < 0:
+      if -rc == WolfSslErrorZeroReturn:
+        raise newException(WolfTlsClosedError, "TLS peer closed connection")
       raise newException(WolfTlsError, &"wolfSSL_read failed: {-rc}")
     else:
       await transp.feedEncryptedByte()

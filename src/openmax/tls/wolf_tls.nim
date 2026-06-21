@@ -6,6 +6,7 @@ export wolfssl_abi
 
 type
   WolfTlsError* = object of CatchableError
+  WolfTlsClosedError* = object of WolfTlsError
 
   WolfTlsContext* = ref object
     ctx*: WolfSslCtxPtr
@@ -136,25 +137,28 @@ proc version*(s: WolfTlsSession): string =
     return ""
   $wolfSSL_get_version(s.ssl)
 
+proc errorCode*(s: WolfTlsSession, ret: cint): cint =
+  wolfSSL_get_error(s.ssl, ret)
+
 proc wantsIo(s: WolfTlsSession, ret: cint): bool =
-  let err = wolfSSL_get_error(s.ssl, ret)
+  let err = s.errorCode(ret)
   err == WolfSslErrorWantRead or err == WolfSslErrorWantWrite
 
 proc acceptStep*(s: WolfTlsSession): int =
   let ret = wolfSSL_accept(s.ssl)
   if ret == 1: return 1
   if s.wantsIo(ret): return 0
-  -wolfSSL_get_error(s.ssl, ret)
+  -s.errorCode(ret)
 
 proc readPlainStep*(s: WolfTlsSession, dst: var openArray[byte]): int =
   let ret = wolfSSL_read(s.ssl, addr dst[0], cint(dst.len))
   if ret > 0: return int(ret)
   if s.wantsIo(ret): return 0
-  -wolfSSL_get_error(s.ssl, ret)
+  -s.errorCode(ret)
 
 proc writePlainStep*(s: WolfTlsSession, data: openArray[byte]): int =
   if data.len == 0: return 0
   let ret = wolfSSL_write(s.ssl, unsafeAddr data[0], cint(data.len))
   if ret > 0: return int(ret)
   if s.wantsIo(ret): return 0
-  -wolfSSL_get_error(s.ssl, ret)
+  -s.errorCode(ret)

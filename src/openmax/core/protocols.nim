@@ -1,4 +1,4 @@
-import std/strformat
+import std/[strformat, strutils]
 import ../config/types
 
 type
@@ -28,9 +28,14 @@ proc `$`*(kind: TransportKind): string =
   of tkTcp: "tcp"
   of tkWebSocket: "ws"
 
+proc formatHostPort*(host: string, port: int): string =
+  let clean = host.strip(chars = {'[', ']'})
+  let displayHost = if clean.contains(":"): "[" & clean & "]" else: clean
+  &"{displayHost}:{port}"
+
 proc describe*(spec: ListenerSpec): string =
-  let tlsSuffix = if spec.tls_enabled and spec.transport == tkTcp: " tls" else: ""
-  &"{spec.protocol}/{spec.transport} {spec.host}:{spec.port}{tlsSuffix}"
+  let tlsSuffix = if spec.tls_enabled: " tls" else: ""
+  &"{spec.protocol}/{spec.transport} {formatHostPort(spec.host, spec.port)}{tlsSuffix}"
 
 proc buildListenerSpecs*(config: AppConfig): seq[ListenerSpec] =
   result = @[]
