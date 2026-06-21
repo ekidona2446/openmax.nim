@@ -25,10 +25,11 @@ type
 
   DbRow* = Table[string, string]
 
-const SqliteDynLib =
-  when defined(windows): "sqlite3.dll"
-  elif defined(macosx): "libsqlite3.0.dylib"
-  else: "libsqlite3.so.0"
+const
+  SqliteDynLib =
+    when defined(windows): "sqlite3.dll"
+    elif defined(macosx): "libsqlite3.0.dylib"
+    else: "libsqlite3.so.0"
 
   SQLITE_OK = 0.cint
   SQLITE_ROW = 100.cint

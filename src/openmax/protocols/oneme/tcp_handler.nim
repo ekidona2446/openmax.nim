@@ -2,6 +2,7 @@ import std/[logging, strformat, strutils, tables, json]
 import chronos
 import msgpack4nim
 import ../../core/connection_context
+import ../../core/app_context
 import ../../core/opcodes
 import ../../crypto/sha256
 import ../../db/store
@@ -146,6 +147,14 @@ type
   OnemeContactUpdatePayload = object
     contactId: int64
     action: string
+
+  OnemeTypingPayload = object
+    chatId: int64
+    `type`: string
+
+  OnemeTypingEvent = object
+    chatId: int64
+    userId: int64
 
   OnemeContactsResponse = object
     contacts: seq[OnemeContactProfile]
@@ -572,6 +581,7 @@ proc handleLogin(ctx: ConnectionContext,
   ctx.currentPhone = phone
   ctx.currentUserId = rowInt64(user, "id")
   ctx.currentSessionToken = payload.token
+  ctx.app.attachClient(ctx.currentUserId, transp)
 
   let response = OnemeLoginResponse(
     profile: buildOnemeProfile(user),
@@ -741,6 +751,44 @@ proc handleSendMessage(ctx: ConnectionContext,
 
   let response = messageFromRow(row)
   await transp.sendResponseObject(frame, CmdOk, MsgSendOpcode, response)
+
+  for participant in participants:
+    for client in ctx.app.transportsForUser(participant):
+      try:
+        await client.sendResponseObject(frame, 0'u8, NotifMessageOpcode, response)
+      except CatchableError as exc:
+        safeInfo(&"[oneme/tcp] failed to fan-out message id={response.id} to user={participant}: {exc.msg}")
+
+proc handleTyping(ctx: ConnectionContext,
+                  transp: StreamTransport,
+                  frame: MobileFrame): Future[void] {.async.} =
+  if not await requireLoggedIn(ctx, transp, frame, MsgTypingOpcode):
+    return
+
+  let payload =
+    try:
+      unpackMapPayload(frame.payload, OnemeTypingPayload)
+    except MsgPackCodecError:
+      await transp.sendErrorResponse(frame, MsgTypingOpcode, invalidPayloadError())
+      return
+
+  let chatId = if payload.chatId == 0: ctx.currentUserId else: payload.chatId
+  let participants = ctx.app.db.participantsOfChat(chatId)
+  if ctx.currentUserId notin participants:
+    await transp.sendErrorResponse(frame, MsgTypingOpcode, invalidTokenError())
+    return
+
+  await transp.sendNilResponse(frame, CmdOk, MsgTypingOpcode)
+
+  let eventPayload = OnemeTypingEvent(chatId: chatId, userId: ctx.currentUserId)
+  for participant in participants:
+    if participant == ctx.currentUserId:
+      continue
+    for client in ctx.app.transportsForUser(participant):
+      try:
+        await client.sendResponseObject(frame, 0'u8, NotifTypingOpcode, eventPayload)
+      except CatchableError as exc:
+        safeInfo(&"[oneme/tcp] failed to fan-out typing to user={participant}: {exc.msg}")
 
 proc handleChatHistory(ctx: ConnectionContext,
                        transp: StreamTransport,
@@ -943,6 +991,8 @@ proc handleTcpFrame*(ctx: ConnectionContext,
     await handleChatInfo(ctx, transp, frame)
   of MsgSendOpcode:
     await handleSendMessage(ctx, transp, frame)
+  of MsgTypingOpcode:
+    await handleTyping(ctx, transp, frame)
   of ChatHistoryOpcode:
     await handleChatHistory(ctx, transp, frame)
   of MsgGetOpcode:

@@ -60,6 +60,10 @@ proc handleTcpClient(runtime: ListenerRuntime,
   except CatchableError as exc:
     safeWarn(&"[transport] tcp client handler error from {peer}: {exc.msg}")
   finally:
+    try:
+      runtime.app.detachClient(ctx.currentUserId, transp)
+    except CatchableError:
+      discard
     await transp.closeWait()
 
 proc serveTcp(runtime: ListenerRuntime): Future[void] {.async: (raises: []).} =
