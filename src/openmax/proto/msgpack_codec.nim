@@ -36,5 +36,11 @@ proc packJsonPayload*(value: JsonNode): seq[byte] {.raises: [MsgPackCodecError].
   except Exception as exc:
     raise newException(MsgPackCodecError, exc.msg)
 
+proc unpackJsonPayload*(data: openArray[byte]): JsonNode {.raises: [MsgPackCodecError].} =
+  try:
+    toJsonNode(bytesToString(data))
+  except Exception as exc:
+    raise newException(MsgPackCodecError, exc.msg)
+
 proc nilPayload*(): seq[byte] =
   @[0xC0'u8]

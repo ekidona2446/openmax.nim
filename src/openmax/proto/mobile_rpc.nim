@@ -28,27 +28,27 @@ proc responseFrame*(request: MobileFrame,
     payload: payload
   )
 
-proc sendResponseBytes*(transp: StreamTransport,
+proc sendResponseBytes*(transp: MobileTransport,
                         request: MobileFrame,
                         cmd: uint8,
                         opcode: uint16,
                         payload: seq[byte]): Future[void] {.async.} =
   await transp.writeFrame(responseFrame(request, cmd, opcode, payload))
 
-proc sendResponseObject*[T](transp: StreamTransport,
+proc sendResponseObject*[T](transp: MobileTransport,
                             request: MobileFrame,
                             cmd: uint8,
                             opcode: uint16,
                             payload: T): Future[void] {.async.} =
   await sendResponseBytes(transp, request, cmd, opcode, packMapPayload(payload))
 
-proc sendNilResponse*(transp: StreamTransport,
+proc sendNilResponse*(transp: MobileTransport,
                       request: MobileFrame,
                       cmd: uint8,
                       opcode: uint16): Future[void] {.async.} =
   await sendResponseBytes(transp, request, cmd, opcode, nilPayload())
 
-proc sendErrorResponse*(transp: StreamTransport,
+proc sendErrorResponse*(transp: MobileTransport,
                         request: MobileFrame,
                         opcode: uint16,
                         payload: ErrorPayload): Future[void] {.async.} =

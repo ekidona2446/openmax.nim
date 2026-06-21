@@ -6,7 +6,7 @@ import ./oneme/tcp_handler as oneme_tcp
 import ./tamtam/tcp_handler as tamtam_tcp
 
 proc dispatchTcpFrame*(ctx: ConnectionContext,
-                       transp: StreamTransport,
+                       transp: MobileTransport,
                        frame: MobileFrame): Future[void] {.async.} =
   case ctx.protocol
   of pkOneme:

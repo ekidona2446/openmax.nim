@@ -265,6 +265,31 @@ proc messagesByIds*(db: AppDatabase, chatId: int64, ids: openArray[int64]): seq[
     if row.len != 0:
       result.add row
 
+proc updateMessage*(db: AppDatabase,
+                    chatId, messageId: int64,
+                    text, attachesJson, elementsJson: string): DbRow =
+  db.sqlite.exec(
+    "UPDATE messages SET text = ?, attaches = ?, elements = ? WHERE chat_id = ? AND id = ?",
+    [
+      textValue(text),
+      textValue(attachesJson),
+      textValue(elementsJson),
+      intValue(chatId),
+      intValue(messageId)
+    ]
+  )
+  db.sqlite.queryRow(
+    "SELECT * FROM messages WHERE chat_id = ? AND id = ? LIMIT 1",
+    [intValue(chatId), intValue(messageId)]
+  )
+
+proc deleteMessages*(db: AppDatabase, chatId: int64, ids: openArray[int64]) =
+  for id in ids:
+    db.sqlite.exec(
+      "DELETE FROM messages WHERE chat_id = ? AND id = ?",
+      [intValue(chatId), intValue(id)]
+    )
+
 proc addContact*(db: AppDatabase, ownerId, contactId: int64) =
   db.sqlite.exec(
     "INSERT OR IGNORE INTO contacts (owner_id, contact_id) VALUES (?, ?)",

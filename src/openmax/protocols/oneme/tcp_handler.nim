@@ -156,6 +156,42 @@ type
     chatId: int64
     userId: int64
 
+  OnemeEditMessagePayload = object
+    chatId: int64
+    messageId: int64
+    text: string
+    elements: seq[string]
+    attachments: seq[string]
+
+  OnemeMessageItemResponse = object
+    message: OnemeMessagePayload
+
+  OnemeDeleteMessagePayload = object
+    chatId: int64
+    messageIds: seq[int64]
+    forMe: bool
+
+  OnemeDeleteEvent = object
+    chatId: int64
+    messageIds: seq[int64]
+    ttl: bool
+
+  OnemeReadMessagePayload = object
+    `type`: string
+    chatId: int64
+    messageId: int64
+    mark: int64
+
+  OnemeReadStateResponse = object
+    unread: int
+    mark: int64
+
+  OnemeReadEvent = object
+    setAsUnread: bool
+    chatId: int64
+    userId: int64
+    mark: int64
+
   OnemeContactsResponse = object
     contacts: seq[OnemeContactProfile]
 
@@ -298,8 +334,8 @@ proc chatFromRow(ctx: ConnectionContext, row: DbRow): OnemeChatPayload =
     modified: lastTime
   )
 
-proc messageToJson(message: OnemeMessagePayload): JsonNode =
-  %*{
+proc messageToJson(message: OnemeMessagePayload, status = ""): JsonNode =
+  result = %*{
     "id": message.id,
     "chatId": message.chatId,
     "sender": message.sender,
@@ -314,6 +350,8 @@ proc messageToJson(message: OnemeMessagePayload): JsonNode =
       "counters": []
     }
   }
+  if status.len > 0:
+    result["status"] = %status
 
 proc participantsToJson(ids: openArray[int64]): JsonNode =
   result = newJObject()
@@ -344,7 +382,7 @@ proc chatsResponseJson(ctx: ConnectionContext, chats: openArray[OnemeChatPayload
     result["chats"].add chatToJson(ctx, chat)
 
 proc requireLoggedIn(ctx: ConnectionContext,
-                     transp: StreamTransport,
+                     transp: MobileTransport,
                      frame: MobileFrame,
                      opcode: uint16): Future[bool] {.async.} =
   if ctx.currentUserId == 0:
@@ -379,7 +417,7 @@ proc deviceNameOrDefault(ctx: ConnectionContext): string =
   if ctx.deviceName.len > 0: ctx.deviceName else: "Unknown"
 
 proc handleSessionInit(ctx: ConnectionContext,
-                       transp: StreamTransport,
+                       transp: MobileTransport,
                        frame: MobileFrame): Future[void] {.async.} =
   let payload =
     try:
@@ -413,7 +451,7 @@ proc handleSessionInit(ctx: ConnectionContext,
   )
 
 proc handleAuthRequest(ctx: ConnectionContext,
-                       transp: StreamTransport,
+                       transp: MobileTransport,
                        frame: MobileFrame): Future[void] {.async.} =
   let payload =
     try:
@@ -447,7 +485,7 @@ proc handleAuthRequest(ctx: ConnectionContext,
   safeInfo(&"[oneme/tcp] auth_request phone={phone} code={verifyCode} existing={not (existingUser.len == 0)}")
 
 proc handleAuth(ctx: ConnectionContext,
-                transp: StreamTransport,
+                transp: MobileTransport,
                 frame: MobileFrame): Future[void] {.async.} =
   let payload =
     try:
@@ -504,7 +542,7 @@ proc handleAuth(ctx: ConnectionContext,
   await transp.sendResponseObject(frame, CmdOk, AuthOpcode, response)
 
 proc handleAuthConfirm(ctx: ConnectionContext,
-                       transp: StreamTransport,
+                       transp: MobileTransport,
                        frame: MobileFrame): Future[void] {.async.} =
   let payload =
     try:
@@ -554,7 +592,7 @@ proc handleAuthConfirm(ctx: ConnectionContext,
   safeInfo(&"[oneme/tcp] auth_confirm registered phone={phone} userId={userId}")
 
 proc handleLogin(ctx: ConnectionContext,
-                 transp: StreamTransport,
+                 transp: MobileTransport,
                  frame: MobileFrame): Future[void] {.async.} =
   let payload =
     try:
@@ -592,7 +630,7 @@ proc handleLogin(ctx: ConnectionContext,
 
   await transp.sendResponseObject(frame, CmdOk, LoginOpcode, response)
 
-proc handlePing(transp: StreamTransport,
+proc handlePing(transp: MobileTransport,
                 frame: MobileFrame): Future[void] {.async.} =
   if frame.payload.len > 0:
     try:
@@ -603,12 +641,12 @@ proc handlePing(transp: StreamTransport,
 
   await transp.sendNilResponse(frame, CmdOk, PingOpcode)
 
-proc handleLog(transp: StreamTransport,
+proc handleLog(transp: MobileTransport,
                frame: MobileFrame): Future[void] {.async.} =
   await transp.sendNilResponse(frame, CmdOk, LogOpcode)
 
 proc handleSessionsInfo(ctx: ConnectionContext,
-                        transp: StreamTransport,
+                        transp: MobileTransport,
                         frame: MobileFrame): Future[void] {.async.} =
   let now = nowUnixMs()
   var sessions: seq[OnemeSessionInfo] = @[]
@@ -637,7 +675,7 @@ proc handleSessionsInfo(ctx: ConnectionContext,
     OnemeSessionsInfoResponse(sessions: sessions)
   )
 
-proc handleFoldersGet(transp: StreamTransport,
+proc handleFoldersGet(transp: MobileTransport,
                       frame: MobileFrame): Future[void] {.async.} =
   let allFolder = OnemeFolderPayload(
     id: "all.chat.folder",
@@ -662,7 +700,7 @@ proc handleFoldersGet(transp: StreamTransport,
   )
 
 proc handleChatsList(ctx: ConnectionContext,
-                     transp: StreamTransport,
+                     transp: MobileTransport,
                      frame: MobileFrame): Future[void] {.async.} =
   if not await requireLoggedIn(ctx, transp, frame, ChatsListOpcode):
     return
@@ -674,7 +712,7 @@ proc handleChatsList(ctx: ConnectionContext,
   await transp.sendResponseBytes(frame, CmdOk, ChatsListOpcode, packJsonPayload(chatsResponseJson(ctx, chats)))
 
 proc handleChatInfo(ctx: ConnectionContext,
-                    transp: StreamTransport,
+                    transp: MobileTransport,
                     frame: MobileFrame): Future[void] {.async.} =
   if not await requireLoggedIn(ctx, transp, frame, ChatInfoOpcode):
     return
@@ -707,7 +745,7 @@ proc storageChatIdFor(ctx: ConnectionContext, requestedChatId, userId: int64): i
     ctx.currentUserId
 
 proc handleSendMessage(ctx: ConnectionContext,
-                       transp: StreamTransport,
+                       transp: MobileTransport,
                        frame: MobileFrame): Future[void] {.async.} =
   if not await requireLoggedIn(ctx, transp, frame, MsgSendOpcode):
     return
@@ -759,8 +797,133 @@ proc handleSendMessage(ctx: ConnectionContext,
       except CatchableError as exc:
         safeInfo(&"[oneme/tcp] failed to fan-out message id={response.id} to user={participant}: {exc.msg}")
 
+proc handleEditMessage(ctx: ConnectionContext,
+                       transp: MobileTransport,
+                       frame: MobileFrame): Future[void] {.async.} =
+  if not await requireLoggedIn(ctx, transp, frame, MsgEditOpcode):
+    return
+
+  let payload =
+    try:
+      unpackMapPayload(frame.payload, OnemeEditMessagePayload)
+    except MsgPackCodecError:
+      await transp.sendErrorResponse(frame, MsgEditOpcode, invalidPayloadError())
+      return
+
+  let chatId = if payload.chatId == 0: ctx.currentUserId else: payload.chatId
+  let participants = ctx.app.db.participantsOfChat(chatId)
+  if ctx.currentUserId notin participants:
+    await transp.sendErrorResponse(frame, MsgEditOpcode, invalidTokenError())
+    return
+
+  let row = ctx.app.db.updateMessage(chatId, payload.messageId, payload.text, "[]", "[]")
+  if row.len == 0:
+    await transp.sendErrorResponse(frame, MsgEditOpcode, notImplementedError())
+    return
+
+  let message = messageFromRow(row)
+  await transp.sendResponseObject(frame, CmdOk, MsgEditOpcode, OnemeMessageItemResponse(message: message))
+
+  for participant in participants:
+    for client in ctx.app.transportsForUser(participant):
+      try:
+        await client.sendResponseBytes(frame, 0'u8, MsgEditOpcode, packJsonPayload(messageToJson(message, "EDITED")))
+      except CatchableError as exc:
+        safeInfo(&"[oneme/tcp] failed to fan-out edit id={message.id} to user={participant}: {exc.msg}")
+
+proc handleDeleteMessages(ctx: ConnectionContext,
+                          transp: MobileTransport,
+                          frame: MobileFrame): Future[void] {.async.} =
+  if not await requireLoggedIn(ctx, transp, frame, MsgDeleteOpcode):
+    return
+
+  let payload =
+    try:
+      unpackMapPayload(frame.payload, OnemeDeleteMessagePayload)
+    except MsgPackCodecError:
+      await transp.sendErrorResponse(frame, MsgDeleteOpcode, invalidPayloadError())
+      return
+
+  let chatId = if payload.chatId == 0: ctx.currentUserId else: payload.chatId
+  let participants = ctx.app.db.participantsOfChat(chatId)
+  if ctx.currentUserId notin participants:
+    await transp.sendErrorResponse(frame, MsgDeleteOpcode, invalidTokenError())
+    return
+
+  if not payload.forMe:
+    ctx.app.db.deleteMessages(chatId, payload.messageIds)
+
+  await transp.sendNilResponse(frame, CmdOk, MsgDeleteOpcode)
+
+  let eventPayload = OnemeDeleteEvent(chatId: chatId, messageIds: payload.messageIds, ttl: false)
+  for participant in participants:
+    for client in ctx.app.transportsForUser(participant):
+      try:
+        await client.sendResponseObject(frame, 0'u8, NotifMsgDeleteOpcode, eventPayload)
+      except CatchableError as exc:
+        safeInfo(&"[oneme/tcp] failed to fan-out delete chat={chatId} to user={participant}: {exc.msg}")
+
+proc handleChatMark(ctx: ConnectionContext,
+                    transp: MobileTransport,
+                    frame: MobileFrame): Future[void] {.async.} =
+  if not await requireLoggedIn(ctx, transp, frame, ChatMarkOpcode):
+    return
+
+  let payload =
+    try:
+      unpackMapPayload(frame.payload, OnemeReadMessagePayload)
+    except MsgPackCodecError:
+      await transp.sendErrorResponse(frame, ChatMarkOpcode, invalidPayloadError())
+      return
+
+  let chatId = if payload.chatId == 0: ctx.currentUserId else: payload.chatId
+  let participants = ctx.app.db.participantsOfChat(chatId)
+  if ctx.currentUserId notin participants:
+    await transp.sendErrorResponse(frame, ChatMarkOpcode, invalidTokenError())
+    return
+
+  let mark = if payload.mark > 0: payload.mark else: nowUnixMs()
+  await transp.sendResponseObject(frame, CmdOk, ChatMarkOpcode, OnemeReadStateResponse(unread: 0, mark: mark))
+
+  let eventPayload = OnemeReadEvent(setAsUnread: false, chatId: chatId, userId: ctx.currentUserId, mark: mark)
+  for participant in participants:
+    if participant == ctx.currentUserId:
+      continue
+    for client in ctx.app.transportsForUser(participant):
+      try:
+        await client.sendResponseObject(frame, 0'u8, NotifMarkOpcode, eventPayload)
+      except CatchableError as exc:
+        safeInfo(&"[oneme/tcp] failed to fan-out mark chat={chatId} to user={participant}: {exc.msg}")
+
+proc handleSync(ctx: ConnectionContext,
+                transp: MobileTransport,
+                frame: MobileFrame): Future[void] {.async.} =
+  if not await requireLoggedIn(ctx, transp, frame, SyncOpcode):
+    return
+
+  var contacts: seq[OnemeContactProfile] = @[]
+  let payload =
+    try:
+      unpackJsonPayload(frame.payload)
+    except MsgPackCodecError:
+      newJObject()
+
+  if payload.kind == JObject and payload.hasKey("contactList") and payload["contactList"].kind == JObject:
+    for phone, _ in payload["contactList"]:
+      let user = ctx.app.db.findUserByPhone(normalizePhoneNumber(phone))
+      if user.len != 0:
+        ctx.app.db.addContact(ctx.currentUserId, rowInt64(user, "id"))
+        contacts.add buildOnemeProfile(user).contact
+  else:
+    for userId in ctx.app.db.contactIdsForUser(ctx.currentUserId):
+      let user = ctx.app.db.findUserById(userId)
+      if user.len != 0:
+        contacts.add buildOnemeProfile(user).contact
+
+  await transp.sendResponseObject(frame, CmdOk, SyncOpcode, OnemeContactsResponse(contacts: contacts))
+
 proc handleTyping(ctx: ConnectionContext,
-                  transp: StreamTransport,
+                  transp: MobileTransport,
                   frame: MobileFrame): Future[void] {.async.} =
   if not await requireLoggedIn(ctx, transp, frame, MsgTypingOpcode):
     return
@@ -791,7 +954,7 @@ proc handleTyping(ctx: ConnectionContext,
         safeInfo(&"[oneme/tcp] failed to fan-out typing to user={participant}: {exc.msg}")
 
 proc handleChatHistory(ctx: ConnectionContext,
-                       transp: StreamTransport,
+                       transp: MobileTransport,
                        frame: MobileFrame): Future[void] {.async.} =
   if not await requireLoggedIn(ctx, transp, frame, ChatHistoryOpcode):
     return
@@ -816,7 +979,7 @@ proc handleChatHistory(ctx: ConnectionContext,
   await transp.sendResponseObject(frame, CmdOk, ChatHistoryOpcode, OnemeMessagesListResponse(messages: messages))
 
 proc handleGetMessages(ctx: ConnectionContext,
-                       transp: StreamTransport,
+                       transp: MobileTransport,
                        frame: MobileFrame): Future[void] {.async.} =
   if not await requireLoggedIn(ctx, transp, frame, MsgGetOpcode):
     return
@@ -837,7 +1000,7 @@ proc handleGetMessages(ctx: ConnectionContext,
   await transp.sendResponseObject(frame, CmdOk, MsgGetOpcode, OnemeMessagesListResponse(messages: messages))
 
 proc handleCallsToken(ctx: ConnectionContext,
-                      transp: StreamTransport,
+                      transp: MobileTransport,
                       frame: MobileFrame): Future[void] {.async.} =
   if ctx.currentUserId == 0:
     await transp.sendErrorResponse(frame, CallsTokenOpcode, invalidTokenError())
@@ -845,7 +1008,7 @@ proc handleCallsToken(ctx: ConnectionContext,
 
   # maxcalls documents opcode 158 as CallTokenRequest.  A full Calls API
   # implementation will validate this token later; for now it encodes enough
-  # local identity for localhost federation experiments.
+  # local identity for yggdrasil federation experiments.
   let callToken = "openmax-call:" & $ctx.currentUserId & ":" & generateRandomString(64)
   await transp.sendResponseObject(
     frame,
@@ -855,7 +1018,7 @@ proc handleCallsToken(ctx: ConnectionContext,
   )
 
 proc handleContactInfo(ctx: ConnectionContext,
-                       transp: StreamTransport,
+                       transp: MobileTransport,
                        frame: MobileFrame): Future[void] {.async.} =
   if not await requireLoggedIn(ctx, transp, frame, ContactInfoOpcode):
     return
@@ -876,7 +1039,7 @@ proc handleContactInfo(ctx: ConnectionContext,
   await transp.sendResponseObject(frame, CmdOk, ContactInfoOpcode, OnemeContactsResponse(contacts: contacts))
 
 proc handleContactUpdate(ctx: ConnectionContext,
-                         transp: StreamTransport,
+                         transp: MobileTransport,
                          frame: MobileFrame): Future[void] {.async.} =
   if not await requireLoggedIn(ctx, transp, frame, ContactUpdateOpcode):
     return
@@ -911,7 +1074,7 @@ proc handleContactUpdate(ctx: ConnectionContext,
     await transp.sendErrorResponse(frame, ContactUpdateOpcode, invalidPayloadError())
 
 proc handleContactList(ctx: ConnectionContext,
-                       transp: StreamTransport,
+                       transp: MobileTransport,
                        frame: MobileFrame): Future[void] {.async.} =
   if not await requireLoggedIn(ctx, transp, frame, ContactListOpcode):
     return
@@ -925,7 +1088,7 @@ proc handleContactList(ctx: ConnectionContext,
   await transp.sendResponseObject(frame, CmdOk, ContactListOpcode, OnemeContactsResponse(contacts: contacts))
 
 proc handleContactInfoByPhone(ctx: ConnectionContext,
-                              transp: StreamTransport,
+                              transp: MobileTransport,
                               frame: MobileFrame): Future[void] {.async.} =
   let payload =
     try:
@@ -960,7 +1123,7 @@ proc handleContactInfoByPhone(ctx: ConnectionContext,
   )
 
 proc handleTcpFrame*(ctx: ConnectionContext,
-                     transp: StreamTransport,
+                     transp: MobileTransport,
                      frame: MobileFrame): Future[void] {.async.} =
   safeInfo(
     &"[oneme/tcp] frame from {ctx.peer}: ver={frame.header.ver} cmd={frame.header.cmd} seq={frame.header.seq} opcode={frame.header.opcode} comp={frame.header.compressionFlag} payload={frame.payload.len}B"
@@ -989,8 +1152,16 @@ proc handleTcpFrame*(ctx: ConnectionContext,
     await handleChatsList(ctx, transp, frame)
   of ChatInfoOpcode:
     await handleChatInfo(ctx, transp, frame)
+  of SyncOpcode:
+    await handleSync(ctx, transp, frame)
   of MsgSendOpcode:
     await handleSendMessage(ctx, transp, frame)
+  of MsgEditOpcode:
+    await handleEditMessage(ctx, transp, frame)
+  of MsgDeleteOpcode:
+    await handleDeleteMessages(ctx, transp, frame)
+  of ChatMarkOpcode:
+    await handleChatMark(ctx, transp, frame)
   of MsgTypingOpcode:
     await handleTyping(ctx, transp, frame)
   of ChatHistoryOpcode:

@@ -1,3 +1,5 @@
+{.passC: "-Wno-incompatible-pointer-types".}
+
 import std/os
 import chronos
 import openmax/app

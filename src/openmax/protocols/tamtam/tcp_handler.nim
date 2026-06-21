@@ -140,7 +140,7 @@ proc deviceNameOrDefault(ctx: ConnectionContext): string =
   if ctx.deviceName.len > 0: ctx.deviceName else: "Unknown device"
 
 proc handleSessionInit(ctx: ConnectionContext,
-                       transp: StreamTransport,
+                       transp: MobileTransport,
                        frame: MobileFrame): Future[void] {.async.} =
   let payload =
     try:
@@ -173,7 +173,7 @@ proc handleSessionInit(ctx: ConnectionContext,
   )
 
 proc handleAuthRequest(ctx: ConnectionContext,
-                       transp: StreamTransport,
+                       transp: MobileTransport,
                        frame: MobileFrame): Future[void] {.async.} =
   let payload =
     try:
@@ -208,7 +208,7 @@ proc handleAuthRequest(ctx: ConnectionContext,
   safeInfo(&"[tamtam/tcp] auth_request phone={phone} code={verifyCode} existing={not (existingUser.len == 0)}")
 
 proc handleAuth(ctx: ConnectionContext,
-                transp: StreamTransport,
+                transp: MobileTransport,
                 frame: MobileFrame): Future[void] {.async.} =
   let payload =
     try:
@@ -255,7 +255,7 @@ proc handleAuth(ctx: ConnectionContext,
   await transp.sendResponseObject(frame, CmdOk, AuthOpcode, response)
 
 proc handleAuthConfirm(ctx: ConnectionContext,
-                       transp: StreamTransport,
+                       transp: MobileTransport,
                        frame: MobileFrame): Future[void] {.async.} =
   let payload =
     try:
@@ -311,7 +311,7 @@ proc handleAuthConfirm(ctx: ConnectionContext,
   safeInfo(&"[tamtam/tcp] auth_confirm finished phone={phone} userId={userId}")
 
 proc handleLogin(ctx: ConnectionContext,
-                 transp: StreamTransport,
+                 transp: MobileTransport,
                  frame: MobileFrame): Future[void] {.async.} =
   let payload =
     try:
@@ -344,7 +344,7 @@ proc handleLogin(ctx: ConnectionContext,
 
   await transp.sendResponseObject(frame, CmdOk, LoginOpcode, response)
 
-proc handlePing(transp: StreamTransport,
+proc handlePing(transp: MobileTransport,
                 frame: MobileFrame): Future[void] {.async.} =
   if frame.payload.len > 0:
     try:
@@ -355,12 +355,12 @@ proc handlePing(transp: StreamTransport,
 
   await transp.sendNilResponse(frame, CmdOk, PingOpcode)
 
-proc handleLog(transp: StreamTransport,
+proc handleLog(transp: MobileTransport,
                frame: MobileFrame): Future[void] {.async.} =
   await transp.sendNilResponse(frame, CmdOk, LogOpcode)
 
 proc handleTcpFrame*(ctx: ConnectionContext,
-                     transp: StreamTransport,
+                     transp: MobileTransport,
                      frame: MobileFrame): Future[void] {.async.} =
   safeInfo(
     &"[tamtam/tcp] frame from {ctx.peer}: ver={frame.header.ver} cmd={frame.header.cmd} seq={frame.header.seq} opcode={frame.header.opcode} comp={frame.header.compressionFlag} payload={frame.payload.len}B"

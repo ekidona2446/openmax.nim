@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import hashlib
 import sqlite3
@@ -7,30 +8,25 @@ from pathlib import Path
 from pymax.protocol import OutboundFrame
 from pymax.protocol.tcp import TcpProtocol
 from pymax.protocol.tcp.framing import TcpPacketFramer
-from pymax.transport.tcp import TCPTransport
-
-ROOT = Path(__file__).resolve().parents[1]
-DB_PATH = ROOT / "pymax.db"
-CERT_PATH = ROOT / "certs" / "localhost-cert.pem"
 
 
-async def invoke(transport: TCPTransport, protocol: TcpProtocol, frame: OutboundFrame):
-    raw = protocol.encode(frame)
-    await transport.send(raw)
+async def invoke(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, protocol: TcpProtocol, frame: OutboundFrame):
+    writer.write(protocol.encode(frame))
+    await writer.drain()
 
     framer = TcpPacketFramer()
-    header = await transport.recv(framer.HEADER_SIZE)
+    header = await reader.readexactly(framer.HEADER_SIZE)
     payload_len = framer.unpack_header(header)
     if payload_len is None:
         raise RuntimeError("failed to read tcp header")
-    payload = await transport.recv(payload_len)
+    payload = await reader.readexactly(payload_len)
     return protocol.decode(header + payload)
 
 
-def fetch_code(token: str) -> str:
-    conn = sqlite3.connect(DB_PATH)
+def fetch_code(db_path: str, token: str) -> str:
+    conn = sqlite3.connect(db_path)
     row = conn.execute(
-        "select code_hash from auth_tokens where token_hash = ?",
+        "SELECT code_hash FROM auth_tokens WHERE token_hash = ?",
         (hashlib.sha256(token.encode()).hexdigest(),),
     ).fetchone()
     conn.close()
@@ -45,19 +41,34 @@ def fetch_code(token: str) -> str:
 
 
 async def main():
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    # Or: ctx.load_verify_locations(CERT_PATH)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default="::1")
+    parser.add_argument("--port", type=int, default=19443)
+    parser.add_argument("--db", default=str(Path(__file__).resolve().parents[1] / "pymax-tcp-tls.db"))
+    parser.add_argument("--phone", default="+7 999 000 10 01")
+    parser.add_argument("--ca-cert", default="")
+    parser.add_argument("--insecure", action="store_true")
+    args = parser.parse_args()
 
-    transport = TCPTransport(host="::1", port=2443, proxy=None, use_ssl=True, ssl_context=ctx)
+    ctx = ssl.create_default_context()
+    if args.insecure:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    elif args.ca_cert:
+        ctx.load_verify_locations(args.ca_cert)
+
+    reader, writer = await asyncio.open_connection(
+        args.host,
+        args.port,
+        ssl=ctx,
+        server_hostname=None if args.insecure else args.host,
+    )
     protocol = TcpProtocol()
-    await transport.connect()
 
     hello = {
         "clientSessionId": 1,
-        "mt_instanceid": "pymax-tls-probe",
-        "deviceId": "pymax-dev-tls",
+        "mt_instanceid": "pymax-tcp-tls-probe",
+        "deviceId": "pymax-tcp-tls-dev",
         "userAgent": {
             "deviceType": "ANDROID",
             "appVersion": "26.14.1",
@@ -66,84 +77,52 @@ async def main():
             "screen": "1080x2400",
             "pushDeviceType": "GCM",
             "locale": "ru_RU",
-            "deviceName": "PyMax TLS Probe",
+            "deviceName": "PyMax TCP TLS Probe",
             "deviceLocale": "ru_RU",
         },
     }
 
-    resp = await invoke(
-        transport,
-        protocol,
-        OutboundFrame(ver=10, cmd=0, seq=1, opcode=6, payload=hello),
-    )
+    resp = await invoke(reader, writer, protocol, OutboundFrame(ver=10, cmd=0, seq=1, opcode=6, payload=hello))
     print("SESSION_INIT:", resp.model_dump())
 
     auth_request = await invoke(
-        transport,
+        reader,
+        writer,
         protocol,
-        OutboundFrame(
-            ver=10,
-            cmd=0,
-            seq=2,
-            opcode=17,
-            payload={"phone": "+7 999 000 00 77", "type": "START_AUTH"},
-        ),
+        OutboundFrame(ver=10, cmd=0, seq=2, opcode=17, payload={"phone": args.phone, "type": "START_AUTH", "language": "ru"}),
     )
     print("AUTH_REQUEST:", auth_request.model_dump())
 
     token = auth_request.payload["token"]
-    code = fetch_code(token)
+    code = fetch_code(args.db, token)
 
     auth = await invoke(
-        transport,
+        reader,
+        writer,
         protocol,
-        OutboundFrame(
-            ver=10,
-            cmd=0,
-            seq=3,
-            opcode=18,
-            payload={
-                "verifyCode": code,
-                "authTokenType": "CHECK_CODE",
-                "token": token,
-            },
-        ),
+        OutboundFrame(ver=10, cmd=0, seq=3, opcode=18, payload={"verifyCode": code, "authTokenType": "CHECK_CODE", "token": token}),
     )
     print("AUTH:", auth.model_dump())
 
     confirm = await invoke(
-        transport,
+        reader,
+        writer,
         protocol,
-        OutboundFrame(
-            ver=10,
-            cmd=0,
-            seq=4,
-            opcode=23,
-            payload={
-                "firstName": "Tls",
-                "lastName": "User",
-                "token": token,
-                "tokenType": "REGISTER",
-            },
-        ),
+        OutboundFrame(ver=10, cmd=0, seq=4, opcode=23, payload={"firstName": "TlsTcp", "lastName": "Probe", "token": token, "tokenType": "REGISTER"}),
     )
     print("AUTH_CONFIRM:", confirm.model_dump())
 
     login_token = confirm.payload["token"]
     login = await invoke(
-        transport,
+        reader,
+        writer,
         protocol,
-        OutboundFrame(
-            ver=10,
-            cmd=0,
-            seq=5,
-            opcode=19,
-            payload={"token": login_token, "interactive": True},
-        ),
+        OutboundFrame(ver=10, cmd=0, seq=5, opcode=19, payload={"token": login_token, "interactive": True}),
     )
     print("LOGIN:", login.model_dump())
 
-    await transport.close()
+    writer.close()
+    await writer.wait_closed()
 
 
 if __name__ == "__main__":

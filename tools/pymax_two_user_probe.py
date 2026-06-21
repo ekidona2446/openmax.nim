@@ -9,6 +9,7 @@ from pymax.auth.providers import SmsCodeProvider
 from pymax.client import Client
 from pymax.config import ExtraConfig, RegistrationConfig
 from pymax.protocol.enums import Opcode
+from pymax.types.domain import ContactInfo
 
 
 class DbSmsCodeProvider(SmsCodeProvider):
@@ -71,6 +72,9 @@ async def main():
     c2 = make_client(args, args.phone[1], str(Path(args.work_root) / "u2"), "Bob")
     bob_events = []
     bob_typing_events = []
+    bob_edit_events = []
+    bob_delete_events = []
+    alice_read_events = []
 
     @c2.on_message()
     async def on_bob_message(message, client):
@@ -81,6 +85,21 @@ async def main():
     async def on_bob_typing(event, client):
         bob_typing_events.append(event)
         print("bob-typing", event.model_dump())
+
+    @c2.on_message_edit()
+    async def on_bob_edit(message, client):
+        bob_edit_events.append(message)
+        print("bob-edit", message.model_dump())
+
+    @c2.on_message_delete()
+    async def on_bob_delete(event, client):
+        bob_delete_events.append(event)
+        print("bob-delete", event.model_dump())
+
+    @c1.on_message_read()
+    async def on_alice_read(event, client):
+        alice_read_events.append(event)
+        print("alice-read", event.model_dump())
 
     await c1._app.start()
     await c2._app.start()
@@ -93,6 +112,9 @@ async def main():
         found2 = await c1.search_by_phone(args.phone[1])
         found1 = await c2.search_by_phone(args.phone[0])
         print("found", {"c1_found": found2.model_dump(), "c2_found": found1.model_dump()})
+
+        imported = await c1.import_contacts([ContactInfo(phone=args.phone[1], first_name="Bob")])
+        print("imported", [u.model_dump() for u in imported])
 
         contact2 = await c1.add_contact(found2.id)
         contact1 = await c2.add_contact(found1.id)
@@ -133,6 +155,31 @@ async def main():
         assert bob_typing_events, "Bob did not receive NOTIF_TYPING"
         assert contact_list_1.payload.get("contacts"), "Alice contact list is empty"
         assert contact_list_2.payload.get("contacts"), "Bob contact list is empty"
+
+        edited = await c1.edit_message(chat_id, sent.id, "edited hello Bob")
+        print("edited", edited.model_dump())
+        await asyncio.sleep(0.5)
+        assert any(getattr(m, "id", None) == sent.id and getattr(m, "text", "") == "edited hello Bob" for m in bob_edit_events), "Bob did not receive MSG_EDIT event"
+
+        read_state = await c2.read_message(sent.id, chat_id)
+        print("read-state", read_state.model_dump())
+        await asyncio.sleep(0.5)
+        assert alice_read_events, "Alice did not receive NOTIF_MARK"
+
+        deleted = await c1.delete_message(chat_id, [sent.id], for_me=False)
+        print("deleted", deleted)
+        await asyncio.sleep(0.5)
+        assert bob_delete_events, "Bob did not receive NOTIF_MSG_DELETE"
+        after_delete = await c2.fetch_history(chat_id, backward=10)
+        print("history-after-delete", [m.model_dump() for m in after_delete or []])
+        assert not after_delete, "Deleted message is still visible in history"
+
+        removed = await c1.remove_contact(found2.id)
+        print("contact-removed", removed)
+        contact_list_removed = await c1._app.invoke(Opcode.CONTACT_LIST, {})
+        print("contact-list-removed", contact_list_removed.payload)
+        assert not contact_list_removed.payload.get("contacts"), "Alice contact list is not empty after remove"
+
         print("two-user-probe ok")
     finally:
         await c1.close()

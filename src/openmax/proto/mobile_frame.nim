@@ -1,5 +1,6 @@
 import std/[strformat]
 import chronos
+import chronos/streams/tlsstream
 import ./lz4_block
 
 const
@@ -22,6 +23,15 @@ type
   MobileFrame* = object
     header*: MobileHeader
     payload*: seq[byte]
+
+  MobileTransport* = ref object
+    raw*: StreamTransport
+    reader*: AsyncStreamReader
+    writer*: AsyncStreamWriter
+    tlsPrivateKey*: TLSPrivateKey
+    tlsCertificate*: TLSCertificate
+    tlsStream*: TLSAsyncStream
+    tls*: bool
 
 proc readUint16Be(data: openArray[byte], offset: int): uint16 =
   (uint16(data[offset]) shl 8) or uint16(data[offset + 1])
@@ -144,6 +154,28 @@ proc unpackFrame*(data: openArray[byte],
     maxDecompressedSize
   )
 
+proc newPlainMobileTransport*(transp: StreamTransport): MobileTransport =
+  MobileTransport(raw: transp, tls: false)
+
+proc newTlsMobileTransport*(transp: StreamTransport,
+                            privateKey: TLSPrivateKey,
+                            certificate: TLSCertificate): MobileTransport =
+  result = MobileTransport(
+    raw: transp,
+    tlsPrivateKey: privateKey,
+    tlsCertificate: certificate,
+    tls: true
+  )
+  let tlsStream = newTLSServerAsyncStream(
+    newAsyncStreamReader(transp),
+    newAsyncStreamWriter(transp),
+    result.tlsPrivateKey,
+    result.tlsCertificate
+  )
+  result.tlsStream = tlsStream
+  result.reader = tlsStream.reader
+  result.writer = tlsStream.writer
+
 proc readFrame*(transp: StreamTransport,
                 maxPayloadSize = DefaultMaxPayloadSize,
                 maxDecompressedSize = DefaultMaxDecompressedSize): Future[MobileFrame] {.
@@ -162,6 +194,37 @@ proc readFrame*(transp: StreamTransport,
   await transp.readExactly(addr wirePayload[0], wirePayload.len)
   result.payload = decodeWirePayload(header, wirePayload, maxDecompressedSize)
 
+proc readFrame*(transp: MobileTransport,
+                maxPayloadSize = DefaultMaxPayloadSize,
+                maxDecompressedSize = DefaultMaxDecompressedSize): Future[MobileFrame] {.
+                  async: (raises: [MobileFrameError, TransportError, AsyncStreamError, CancelledError]).} =
+  if not transp.tls:
+    return await transp.raw.readFrame(maxPayloadSize, maxDecompressedSize)
+
+  var headerBytes = newSeq[byte](MobileHeaderSize)
+  await transp.reader.readExactly(addr headerBytes[0], headerBytes.len)
+
+  let header = decodeHeader(headerBytes, maxPayloadSize)
+  result.header = header
+
+  if header.payloadLength == 0:
+    result.payload = @[]
+    return
+
+  var wirePayload = newSeq[byte](header.payloadLength)
+  await transp.reader.readExactly(addr wirePayload[0], wirePayload.len)
+  result.payload = decodeWirePayload(header, wirePayload, maxDecompressedSize)
+
 proc writeFrame*(transp: StreamTransport, frame: MobileFrame): Future[void] {.async.} =
   let packed = packFrame(frame.header, frame.payload)
   discard await transp.write(packed)
+
+proc writeFrame*(transp: MobileTransport, frame: MobileFrame): Future[void] {.async.} =
+  let packed = packFrame(frame.header, frame.payload)
+  if not transp.tls:
+    discard await transp.raw.write(packed)
+  else:
+    await transp.writer.write(addr packed[0], packed.len)
+
+proc closeWait*(transp: MobileTransport): Future[void] {.async: (raises: []).} =
+  await transp.raw.closeWait()
