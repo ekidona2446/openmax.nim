@@ -25,12 +25,15 @@ type
 
   DbRow* = Table[string, string]
 
-const
+const SqliteDynLib =
+  when defined(windows): "sqlite3.dll"
+  elif defined(macosx): "libsqlite3.0.dylib"
+  else: "libsqlite3.so.0"
+
   SQLITE_OK = 0.cint
   SQLITE_ROW = 100.cint
   SQLITE_DONE = 101.cint
   SQLITE_TRANSIENT = cast[pointer](-1)
-  SqliteDynLib = "libsqlite3.so.0"
 
 proc sqlite3_open(filename: cstring, ppDb: ptr ptr SqliteNative): cint {.importc: "sqlite3_open", dynlib: SqliteDynLib.}
 proc sqlite3_close(db: ptr SqliteNative): cint {.importc: "sqlite3_close", dynlib: SqliteDynLib.}

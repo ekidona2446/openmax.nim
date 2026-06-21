@@ -9,7 +9,7 @@ type
 const
   OnemeProfile* = ProtocolProfile(
     kind: pkOneme,
-    name: "MAX / Oneme",
+    name: "MAX",
     session_namespace: "oneme"
   )
 

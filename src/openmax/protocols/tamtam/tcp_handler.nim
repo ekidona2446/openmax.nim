@@ -295,7 +295,7 @@ proc handleAuthConfirm(ctx: ConnectionContext,
     loginToken,
     deviceTypeOrDefault(ctx, payload.deviceType),
     deviceNameOrDefault(ctx),
-    "Localhost Federation",
+    "Yggdrasil Federation",
     nowUnixMs()
   )
 

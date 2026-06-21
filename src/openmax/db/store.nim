@@ -59,7 +59,7 @@ proc openDatabase*(config: DatabaseConfig, projectDir: string): AppDatabase =
   createDir(parentDir(dbPath))
 
   let sqlite = openSqlite(dbPath)
-  let schemaPath = projectDir / "sql" / "tables.mysql.sql"
+  let schemaPath = projectDir / "sql" / "tables.sql"
   let schema = readFile(schemaPath)
   sqlite.execScript(schema)
 
@@ -264,6 +264,25 @@ proc messagesByIds*(db: AppDatabase, chatId: int64, ids: openArray[int64]): seq[
     )
     if row.len != 0:
       result.add row
+
+proc addContact*(db: AppDatabase, ownerId, contactId: int64) =
+  db.sqlite.exec(
+    "INSERT OR IGNORE INTO contacts (owner_id, contact_id) VALUES (?, ?)",
+    [intValue(ownerId), intValue(contactId)]
+  )
+
+proc removeContact*(db: AppDatabase, ownerId, contactId: int64) =
+  db.sqlite.exec(
+    "DELETE FROM contacts WHERE owner_id = ? AND contact_id = ?",
+    [intValue(ownerId), intValue(contactId)]
+  )
+
+proc contactIdsForUser*(db: AppDatabase, ownerId: int64): seq[int64] =
+  for row in db.sqlite.queryAll(
+    "SELECT contact_id FROM contacts WHERE owner_id = ? ORDER BY contact_id",
+    [intValue(ownerId)]
+  ):
+    result.add dbRowString(row, "contact_id").parseBiggestInt().int64
 
 proc insertMessage*(db: AppDatabase,
                     chatId, sender, cid: int64,

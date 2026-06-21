@@ -140,6 +140,16 @@ type
   OnemeContactByPhonePayload = object
     phone: string
 
+  OnemeContactInfoPayload = object
+    contactIds: seq[int64]
+
+  OnemeContactUpdatePayload = object
+    contactId: int64
+    action: string
+
+  OnemeContactsResponse = object
+    contacts: seq[OnemeContactProfile]
+
   OnemeContactInfoByPhoneResponse = object
     contact: OnemeContactProfile
 
@@ -473,7 +483,7 @@ proc handleAuth(ctx: ConnectionContext,
     loginToken,
     deviceTypeOrDefault(ctx),
     deviceNameOrDefault(ctx),
-    "Localhost Federation",
+    "Yggdrasil Federation",
     nowUnixMs()
   )
 
@@ -517,7 +527,7 @@ proc handleAuthConfirm(ctx: ConnectionContext,
     loginToken,
     deviceTypeOrDefault(ctx),
     deviceNameOrDefault(ctx),
-    "Localhost Federation",
+    "Yggdrasil Federation",
     nowUnixMs()
   )
 
@@ -796,6 +806,76 @@ proc handleCallsToken(ctx: ConnectionContext,
     OnemeCallTokenResponse(token: callToken)
   )
 
+proc handleContactInfo(ctx: ConnectionContext,
+                       transp: StreamTransport,
+                       frame: MobileFrame): Future[void] {.async.} =
+  if not await requireLoggedIn(ctx, transp, frame, ContactInfoOpcode):
+    return
+
+  let payload =
+    try:
+      unpackMapPayload(frame.payload, OnemeContactInfoPayload)
+    except MsgPackCodecError:
+      await transp.sendErrorResponse(frame, ContactInfoOpcode, invalidPayloadError())
+      return
+
+  var contacts: seq[OnemeContactProfile] = @[]
+  for userId in payload.contactIds:
+    let user = ctx.app.db.findUserById(userId)
+    if user.len != 0:
+      contacts.add buildOnemeProfile(user).contact
+
+  await transp.sendResponseObject(frame, CmdOk, ContactInfoOpcode, OnemeContactsResponse(contacts: contacts))
+
+proc handleContactUpdate(ctx: ConnectionContext,
+                         transp: StreamTransport,
+                         frame: MobileFrame): Future[void] {.async.} =
+  if not await requireLoggedIn(ctx, transp, frame, ContactUpdateOpcode):
+    return
+
+  let payload =
+    try:
+      unpackMapPayload(frame.payload, OnemeContactUpdatePayload)
+    except MsgPackCodecError:
+      await transp.sendErrorResponse(frame, ContactUpdateOpcode, invalidPayloadError())
+      return
+
+  let user = ctx.app.db.findUserById(payload.contactId)
+  if user.len == 0:
+    await transp.sendErrorResponse(frame, ContactUpdateOpcode, userNotFoundError())
+    return
+
+  case payload.action.toUpperAscii()
+  of "ADD":
+    ctx.app.db.addContact(ctx.currentUserId, payload.contactId)
+    let chatId = ctx.currentUserId xor payload.contactId
+    ctx.app.db.ensureChat(chatId, ctx.currentUserId, "DIALOG", [ctx.currentUserId, payload.contactId])
+    await transp.sendResponseObject(
+      frame,
+      CmdOk,
+      ContactUpdateOpcode,
+      OnemeContactInfoByPhoneResponse(contact: buildOnemeProfile(user).contact)
+    )
+  of "REMOVE":
+    ctx.app.db.removeContact(ctx.currentUserId, payload.contactId)
+    await transp.sendResponseBytes(frame, CmdOk, ContactUpdateOpcode, packJsonPayload(%*{}))
+  else:
+    await transp.sendErrorResponse(frame, ContactUpdateOpcode, invalidPayloadError())
+
+proc handleContactList(ctx: ConnectionContext,
+                       transp: StreamTransport,
+                       frame: MobileFrame): Future[void] {.async.} =
+  if not await requireLoggedIn(ctx, transp, frame, ContactListOpcode):
+    return
+
+  var contacts: seq[OnemeContactProfile] = @[]
+  for userId in ctx.app.db.contactIdsForUser(ctx.currentUserId):
+    let user = ctx.app.db.findUserById(userId)
+    if user.len != 0:
+      contacts.add buildOnemeProfile(user).contact
+
+  await transp.sendResponseObject(frame, CmdOk, ContactListOpcode, OnemeContactsResponse(contacts: contacts))
+
 proc handleContactInfoByPhone(ctx: ConnectionContext,
                               transp: StreamTransport,
                               frame: MobileFrame): Future[void] {.async.} =
@@ -867,6 +947,12 @@ proc handleTcpFrame*(ctx: ConnectionContext,
     await handleChatHistory(ctx, transp, frame)
   of MsgGetOpcode:
     await handleGetMessages(ctx, transp, frame)
+  of ContactInfoOpcode:
+    await handleContactInfo(ctx, transp, frame)
+  of ContactUpdateOpcode:
+    await handleContactUpdate(ctx, transp, frame)
+  of ContactListOpcode:
+    await handleContactList(ctx, transp, frame)
   of ContactInfoByPhoneOpcode:
     await handleContactInfoByPhone(ctx, transp, frame)
   of CallsTokenOpcode:

@@ -1,14 +1,12 @@
 import std/strformat
 
-# when defined(windows)
-#	const liblz4* = "liblz4.dll"
-# elif defined(macosx)
-#	const liblz4* = "liblz4.dylib"
-# else:
-#	const liblz4* = "liblz4.so.1"
-
 type
   Lz4Error* = object of CatchableError
+
+const LibLz4 =
+  when defined(windows): "liblz4.dll"
+  elif defined(macosx): "liblz4.dylib"
+  else: "liblz4.so.1"
 
 const
   DefaultLz4CompressionFlag* = 2'u8
@@ -16,19 +14,19 @@ const
 
 proc lz4CompressBound(inputSize: cint): cint {.
   importc: "LZ4_compressBound",
-  dynlib: "liblz4.so.1"
+  dynlib: LibLz4
 .}
 proc lz4CompressHC(src: ptr char, dst: ptr char,
                    srcSize: cint, dstCapacity: cint,
                    compressionLevel: cint): cint {.
   importc: "LZ4_compress_HC",
-  dynlib: "liblz4.so.1"
+  dynlib: LibLz4
 .}
 proc lz4DecompressSafe(src: ptr char, dst: ptr char,
                        compressedSize: cint,
                        dstCapacity: cint): cint {.
   importc: "LZ4_decompress_safe",
-  dynlib: "liblz4.so.1"
+  dynlib: LibLz4
 .}
 
 proc compressBlock*(input: openArray[byte],

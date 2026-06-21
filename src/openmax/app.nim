@@ -41,7 +41,7 @@ proc run*(configPath: string): Future[void] {.async.} =
   setupLogging(config.server.log_level)
 
   let projectDir = parentDir(configPath.absolutePath())
-  let schemaPath = projectDir / "sql" / "tables.mysql.sql"
+  let schemaPath = projectDir / "sql" / "tables.sql"
   let database = openDatabase(config.database, projectDir)
   let app = newAppContext(config, database)
 
