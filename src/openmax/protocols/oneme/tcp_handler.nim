@@ -1008,7 +1008,7 @@ proc handleCallsToken(ctx: ConnectionContext,
 
   # maxcalls documents opcode 158 as CallTokenRequest.  A full Calls API
   # implementation will validate this token later; for now it encodes enough
-  # local identity for yggdrasil federation experiments.
+  # local identity for localhost federation experiments.
   let callToken = "openmax-call:" & $ctx.currentUserId & ":" & generateRandomString(64)
   await transp.sendResponseObject(
     frame,

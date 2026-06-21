@@ -152,7 +152,7 @@ proc handleAuth(app: AppContext, ws: WSSession, req: JsonNode): Future[void] {.a
 
   app.db.deleteAuthToken(token)
   let loginToken = generateRandomString(128)
-  app.db.insertSessionToken(phone, loginToken, "WEB", "WebSocket", "Yggdrasil Federation", nowUnixMs())
+  app.db.insertSessionToken(phone, loginToken, "WEB", "WebSocket", "Localhost Federation", nowUnixMs())
   await ws.sendOk(req, AuthOpcode.int, %*{
     "tokenAttrs": {"LOGIN": {"token": loginToken}},
     "profile": profileJson(user)
@@ -180,7 +180,7 @@ proc handleAuthConfirm(app: AppContext, ws: WSSession, req: JsonNode): Future[vo
   let user = app.db.createOnemeUser(phone, firstName, lastName)
   app.db.deleteAuthToken(token)
   let loginToken = generateRandomString(128)
-  app.db.insertSessionToken(phone, loginToken, "WEB", "WebSocket", "Yggdrasil Federation", nowUnixMs())
+  app.db.insertSessionToken(phone, loginToken, "WEB", "WebSocket", "Localhost Federation", nowUnixMs())
   await ws.sendOk(req, AuthConfirmOpcode.int, %*{
     "userToken": rowInt64(user, "id"),
     "profile": profileJson(user),

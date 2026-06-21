@@ -1,12 +1,13 @@
 import std/[strformat]
 import chronos
-import chronos/streams/tlsstream
+import ../tls/wolf_tls
 import ./lz4_block
 
 const
   MobileHeaderSize* = 10
   DefaultMaxPayloadSize* = 1_048_576
   DefaultMaxDecompressedSize* = 1_048_576
+  WolfEncryptedReadChunk = 1
 
 
 type
@@ -26,12 +27,9 @@ type
 
   MobileTransport* = ref object
     raw*: StreamTransport
-    reader*: AsyncStreamReader
-    writer*: AsyncStreamWriter
-    tlsPrivateKey*: TLSPrivateKey
-    tlsCertificate*: TLSCertificate
-    tlsStream*: TLSAsyncStream
+    wolf*: WolfTlsSession
     tls*: bool
+    handshakeDone*: bool
 
 proc readUint16Be(data: openArray[byte], offset: int): uint16 =
   (uint16(data[offset]) shl 8) or uint16(data[offset + 1])
@@ -155,26 +153,66 @@ proc unpackFrame*(data: openArray[byte],
   )
 
 proc newPlainMobileTransport*(transp: StreamTransport): MobileTransport =
-  MobileTransport(raw: transp, tls: false)
+  MobileTransport(raw: transp, tls: false, handshakeDone: true)
 
-proc newTlsMobileTransport*(transp: StreamTransport,
-                            privateKey: TLSPrivateKey,
-                            certificate: TLSCertificate): MobileTransport =
-  result = MobileTransport(
-    raw: transp,
-    tlsPrivateKey: privateKey,
-    tlsCertificate: certificate,
-    tls: true
-  )
-  let tlsStream = newTLSServerAsyncStream(
-    newAsyncStreamReader(transp),
-    newAsyncStreamWriter(transp),
-    result.tlsPrivateKey,
-    result.tlsCertificate
-  )
-  result.tlsStream = tlsStream
-  result.reader = tlsStream.reader
-  result.writer = tlsStream.writer
+proc newTlsMobileTransport*(transp: StreamTransport, ctx: WolfTlsContext): MobileTransport =
+  MobileTransport(raw: transp, wolf: newWolfTlsSession(ctx), tls: true, handshakeDone: false)
+
+proc flushWolfOutput(transp: MobileTransport): Future[void] {.async: (raises: [TransportError, CancelledError]).} =
+  let outData = transp.wolf.takeOutput()
+  if outData.len > 0:
+    discard await transp.raw.write(outData)
+
+proc feedEncryptedByte(transp: MobileTransport): Future[void] {.async: (raises: [TransportError, CancelledError]).} =
+  var b = newSeq[byte](WolfEncryptedReadChunk)
+  await transp.raw.readExactly(addr b[0], b.len)
+  transp.wolf.feed(b)
+
+proc ensureHandshake(transp: MobileTransport): Future[void] {.
+  async: (raises: [TransportError, CancelledError, WolfTlsError]).} =
+  if not transp.tls or transp.handshakeDone:
+    return
+  while true:
+    let rc = transp.wolf.acceptStep()
+    await transp.flushWolfOutput()
+    if rc == 1:
+      transp.handshakeDone = true
+      return
+    if rc < 0:
+      raise newException(WolfTlsError, &"wolfSSL_accept failed: {-rc}")
+    await transp.feedEncryptedByte()
+
+proc readPlainN(transp: MobileTransport, nbytes: int): Future[seq[byte]] {.
+  async: (raises: [TransportError, CancelledError, WolfTlsError]).} =
+  await transp.ensureHandshake()
+  result = newSeq[byte](nbytes)
+  var offset = 0
+  while offset < nbytes:
+    var tmp = newSeq[byte](nbytes - offset)
+    let rc = transp.wolf.readPlainStep(tmp)
+    await transp.flushWolfOutput()
+    if rc > 0:
+      for i in 0 ..< rc:
+        result[offset + i] = tmp[i]
+      offset += rc
+    elif rc < 0:
+      raise newException(WolfTlsError, &"wolfSSL_read failed: {-rc}")
+    else:
+      await transp.feedEncryptedByte()
+
+proc writePlainBytes(transp: MobileTransport, src: seq[byte]) {.
+  async: (raises: [TransportError, CancelledError, WolfTlsError]).} =
+  await transp.ensureHandshake()
+  var offset = 0
+  while offset < src.len:
+    let rc = transp.wolf.writePlainStep(src.toOpenArray(offset, src.len - 1))
+    await transp.flushWolfOutput()
+    if rc > 0:
+      offset += rc
+    elif rc < 0:
+      raise newException(WolfTlsError, &"wolfSSL_write failed: {-rc}")
+    else:
+      await transp.feedEncryptedByte()
 
 proc readFrame*(transp: StreamTransport,
                 maxPayloadSize = DefaultMaxPayloadSize,
@@ -197,12 +235,11 @@ proc readFrame*(transp: StreamTransport,
 proc readFrame*(transp: MobileTransport,
                 maxPayloadSize = DefaultMaxPayloadSize,
                 maxDecompressedSize = DefaultMaxDecompressedSize): Future[MobileFrame] {.
-                  async: (raises: [MobileFrameError, TransportError, AsyncStreamError, CancelledError]).} =
+                  async: (raises: [MobileFrameError, TransportError, WolfTlsError, CancelledError]).} =
   if not transp.tls:
     return await transp.raw.readFrame(maxPayloadSize, maxDecompressedSize)
 
-  var headerBytes = newSeq[byte](MobileHeaderSize)
-  await transp.reader.readExactly(addr headerBytes[0], headerBytes.len)
+  let headerBytes = await transp.readPlainN(MobileHeaderSize)
 
   let header = decodeHeader(headerBytes, maxPayloadSize)
   result.header = header
@@ -211,8 +248,7 @@ proc readFrame*(transp: MobileTransport,
     result.payload = @[]
     return
 
-  var wirePayload = newSeq[byte](header.payloadLength)
-  await transp.reader.readExactly(addr wirePayload[0], wirePayload.len)
+  let wirePayload = await transp.readPlainN(header.payloadLength)
   result.payload = decodeWirePayload(header, wirePayload, maxDecompressedSize)
 
 proc writeFrame*(transp: StreamTransport, frame: MobileFrame): Future[void] {.async.} =
@@ -224,7 +260,9 @@ proc writeFrame*(transp: MobileTransport, frame: MobileFrame): Future[void] {.as
   if not transp.tls:
     discard await transp.raw.write(packed)
   else:
-    await transp.writer.write(addr packed[0], packed.len)
+    await transp.writePlainBytes(packed)
 
 proc closeWait*(transp: MobileTransport): Future[void] {.async: (raises: []).} =
+  if transp.tls and not transp.wolf.isNil:
+    transp.wolf.close()
   await transp.raw.closeWait()

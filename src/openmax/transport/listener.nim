@@ -6,6 +6,7 @@ import ../core/protocols
 import ../core/app_context
 import ../core/connection_context
 import ../proto/mobile_frame
+import ../tls/wolf_tls
 import ../protocols/router
 import ../protocols/oneme/ws_handler
 
@@ -60,11 +61,7 @@ proc handleTcpClient(runtime: ListenerRuntime,
           safeWarn(&"[transport] tcp TLS requested but cert/key not found: cert={certPath} key={keyPath}")
           await rawTransp.closeWait()
           return
-        newTlsMobileTransport(
-          rawTransp,
-          TLSPrivateKey.init(readFile(keyPath)),
-          TLSCertificate.init(readFile(certPath))
-        )
+        newTlsMobileTransport(rawTransp, newWolfTlsContext(certPath, keyPath))
       else:
         newPlainMobileTransport(rawTransp)
     except CatchableError as exc:
