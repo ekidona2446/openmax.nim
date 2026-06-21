@@ -2,11 +2,13 @@ import std/[logging, strformat, strutils, os]
 import chronos
 import chronicles
 import websock/websock
+import websock/http/server as wshttpserver
 import ../core/protocols
 import ../core/app_context
 import ../core/connection_context
 import ../proto/mobile_frame
 import ../tls/wolf_tls
+import ../tls/wolf_asyncstream
 import ../protocols/router
 import ../protocols/oneme/ws_handler
 
@@ -149,6 +151,94 @@ proc serveTcp(runtime: ListenerRuntime): Future[void] {.async: (raises: []).} =
     runtime.server.close()
     await noCancel(runtime.server.join())
 
+proc handleWebSocketRequest(runtime: ListenerRuntime, request: HttpRequest, peer: string): Future[void] {.async.} =
+  try:
+    let server = WSServer.new()
+    let ws = await server.handleRequest(request)
+    if ws.readyState != ReadyState.Open:
+      safeWarn(&"[transport] websocket upgrade failed: {runtime.spec.describe()} peer={peer}")
+      return
+
+    case runtime.spec.protocol
+    of pkOneme:
+      await runtime.app.handleOnemeWebSocket(ws, peer)
+    of pkTamtam:
+      safeWarn(&"[transport] tamtam websocket handler is not implemented yet: peer={peer}")
+      await ws.close()
+  except WebSocketError as exc:
+    safeWarn(&"[transport] websocket error on {runtime.spec.describe()} peer={peer}: {exc.msg}")
+  except CatchableError as exc:
+    safeWarn(&"[transport] websocket request error on {runtime.spec.describe()} peer={peer}: {exc.msg}")
+
+proc handleWolfWebSocketClient(runtime: ListenerRuntime,
+                               rawTransp: StreamTransport,
+                               wolfCtx: WolfTlsContext): Future[void] {.async: (raises: []).} =
+  let peer = peerLabel(rawTransp)
+  try:
+    let stream = newWolfAsyncStream(rawTransp, wolfCtx)
+    let request = await wshttpserver.readHttpRequest(stream, 10.seconds)
+    await handleWebSocketRequest(runtime, request, peer)
+    await stream.closeWait()
+  except WolfTlsClosedError:
+    safeInfo(&"[transport] websocket tls client disconnected: {runtime.spec.protocol} {peer}")
+  except CatchableError as exc:
+    safeWarn(&"[transport] websocket wolfssl client error from {peer}: {exc.msg}")
+  finally:
+    await rawTransp.closeWait()
+
+proc serveWolfWebSocket(runtime: ListenerRuntime,
+                        bindAddress: TransportAddress,
+                        socketFlags: set[ServerFlags],
+                        dualstackMode: DualStackType): Future[void] {.async: (raises: [CancelledError]).} =
+  let (keyPath, certPath) =
+    try:
+      (resolveTlsPath(runtime.app.config.tls.key_file), resolveTlsPath(runtime.app.config.tls.cert_file))
+    except CatchableError as exc:
+      safeWarn(&"[transport] invalid websocket TLS paths: {exc.msg}")
+      return
+  if not fileExists(keyPath) or not fileExists(certPath):
+    safeWarn(&"[transport] websocket TLS requested but cert/key not found: cert={certPath} key={keyPath}")
+    return
+
+  let wolfCtx =
+    try:
+      newWolfTlsContext(certPath, keyPath)
+    except CatchableError as exc:
+      safeWarn(&"[transport] failed to initialize wolfSSL websocket context: {exc.msg}")
+      return
+
+  let server =
+    try:
+      createStreamServer(bindAddress, flags = socketFlags, dualstack = dualstackMode)
+    except TransportOsError as exc:
+      safeWarn(&"[transport] failed to bind websocket {runtime.spec.describe()}: {exc.msg}")
+      return
+
+  safeInfo(&"[transport] wolfSSL websocket listener started: {runtime.spec.describe()} tls=true")
+  block acceptLoop:
+    while true:
+      let raw =
+        try:
+          await server.accept()
+        except TransportTooManyError:
+          safeWarn(&"[transport] too many websocket transports on {runtime.spec.describe()}")
+          continue
+        except TransportAbortedError:
+          continue
+        except TransportUseClosedError:
+          break acceptLoop
+        except TransportOsError as exc:
+          safeWarn(&"[transport] websocket accept failed on {runtime.spec.describe()}: {exc.msg}")
+          break acceptLoop
+        except CancelledError as exc:
+          server.close()
+          raise exc
+      if not raw.isNil:
+        asyncSpawn handleWolfWebSocketClient(runtime, raw, wolfCtx)
+
+  server.close()
+  await noCancel(server.join())
+
 proc serveWebSocket(runtime: ListenerRuntime): Future[void] {.async: (raises: [CancelledError]).} =
   let bindAddress =
     try:
@@ -157,50 +247,25 @@ proc serveWebSocket(runtime: ListenerRuntime): Future[void] {.async: (raises: [C
       safeWarn(&"[transport] invalid websocket bind address for {runtime.spec.describe()}: {exc.msg}")
       return
 
-  proc handleRequest(request: HttpRequest) {.async.} =
-    let peer = "ws-peer"
-
-    try:
-      let server = WSServer.new()
-      let ws = await server.handleRequest(request)
-      if ws.readyState != ReadyState.Open:
-        safeWarn(&"[transport] websocket upgrade failed: {runtime.spec.describe()} peer={peer}")
-        return
-
-      case runtime.spec.protocol
-      of pkOneme:
-        await runtime.app.handleOnemeWebSocket(ws, peer)
-      of pkTamtam:
-        safeWarn(&"[transport] tamtam websocket handler is not implemented yet: peer={peer}")
-        await ws.close()
-    except WebSocketError as exc:
-      safeWarn(&"[transport] websocket error on {runtime.spec.describe()} peer={peer}: {exc.msg}")
-    except CatchableError as exc:
-      safeWarn(&"[transport] websocket request error on {runtime.spec.describe()} peer={peer}: {exc.msg}")
-
   let socketFlags = {ServerFlags.TcpNoDelay, ServerFlags.ReuseAddr}
+  let dualstackValue = if runtime.spec.dualstack_mode.len > 0: runtime.spec.dualstack_mode else: runtime.app.config.server.dualstack_mode
+  let dualstackMode = parseDualStackMode(dualstackValue)
+
+  if runtime.spec.tls_enabled:
+    await runtime.serveWolfWebSocket(bindAddress, socketFlags, dualstackMode)
+    return
+
+  proc handleRequest(request: HttpRequest) {.async.} =
+    await handleWebSocketRequest(runtime, request, "ws-peer")
+
   let server =
     try:
-      if runtime.spec.tls_enabled:
-        let keyPath = resolveTlsPath(runtime.app.config.tls.key_file)
-        let certPath = resolveTlsPath(runtime.app.config.tls.cert_file)
-        if not fileExists(keyPath) or not fileExists(certPath):
-          safeWarn(&"[transport] websocket TLS requested but cert/key not found: cert={certPath} key={keyPath}")
-          return
-        HttpServer.create(
-          bindAddress,
-          tlsPrivateKey = TLSPrivateKey.init(readFile(keyPath)),
-          tlsCertificate = TLSCertificate.init(readFile(certPath)),
-          handler = handleRequest,
-          flags = socketFlags
-        )
-      else:
-        HttpServer.create(bindAddress, handleRequest, flags = socketFlags)
+      HttpServer.create(bindAddress, handleRequest, flags = socketFlags)
     except CatchableError as exc:
       safeWarn(&"[transport] failed to bind websocket {runtime.spec.describe()}: {exc.msg}")
       return
 
-  safeInfo(&"[transport] websocket listener started: {runtime.spec.describe()} tls={runtime.spec.tls_enabled}")
+  safeInfo(&"[transport] websocket listener started: {runtime.spec.describe()} tls=false")
   try:
     server.start()
   except TransportOsError as exc:

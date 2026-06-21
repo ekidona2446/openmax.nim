@@ -19,6 +19,14 @@ type
     outBuf*: seq[byte]
     closed*: bool
 
+  WolfTlsConnection* = ref object
+    raw*: StreamTransport
+    session*: WolfTlsSession
+    handshakeDone*: bool
+
+const
+  WolfEncryptedReadChunk* = 16 * 1024
+
 proc raiseWolf(message: string) {.noreturn.} =
   raise newException(WolfTlsError, message)
 
@@ -117,6 +125,9 @@ proc close*(s: WolfTlsSession) =
     s.ssl = nil
   GC_unref(s)
 
+proc newWolfTlsConnection*(raw: StreamTransport, ctx: WolfTlsContext): WolfTlsConnection =
+  WolfTlsConnection(raw: raw, session: newWolfTlsSession(ctx), handshakeDone: false)
+
 proc feed*(s: WolfTlsSession, data: openArray[byte]) =
   if data.len == 0:
     return
@@ -162,3 +173,61 @@ proc writePlainStep*(s: WolfTlsSession, data: openArray[byte]): int =
   if ret > 0: return int(ret)
   if s.wantsIo(ret): return 0
   -s.errorCode(ret)
+
+proc flushOutput*(c: WolfTlsConnection): Future[void] {.async: (raises: [TransportError, CancelledError]).} =
+  let outData = c.session.takeOutput()
+  if outData.len > 0:
+    discard await c.raw.write(outData)
+
+proc feedEncrypted*(c: WolfTlsConnection): Future[void] {.async: (raises: [TransportError, CancelledError, WolfTlsClosedError]).} =
+  var buf = newSeq[byte](WolfEncryptedReadChunk)
+  let n = await c.raw.readOnce(addr buf[0], buf.len)
+  if n <= 0:
+    raise newException(WolfTlsClosedError, "TLS peer closed transport")
+  buf.setLen(n)
+  c.session.feed(buf)
+
+proc ensureHandshake*(c: WolfTlsConnection): Future[void] {.async: (raises: [TransportError, CancelledError, WolfTlsError]).} =
+  if c.handshakeDone:
+    return
+  while true:
+    let rc = c.session.acceptStep()
+    await c.flushOutput()
+    if rc == 1:
+      c.handshakeDone = true
+      return
+    if rc < 0:
+      if -rc == WolfSslErrorZeroReturn:
+        raise newException(WolfTlsClosedError, "TLS peer closed during handshake")
+      raise newException(WolfTlsError, "wolfSSL_accept failed: " & $(-rc))
+    await c.feedEncrypted()
+
+proc readPlainSome*(c: WolfTlsConnection, maxBytes: int): Future[seq[byte]] {.async: (raises: [TransportError, CancelledError, WolfTlsError]).} =
+  await c.ensureHandshake()
+  while true:
+    result = newSeq[byte](maxBytes)
+    let rc = c.session.readPlainStep(result)
+    await c.flushOutput()
+    if rc > 0:
+      result.setLen(rc)
+      return
+    if rc < 0:
+      if -rc == WolfSslErrorZeroReturn:
+        raise newException(WolfTlsClosedError, "TLS peer closed connection")
+      raise newException(WolfTlsError, "wolfSSL_read failed: " & $(-rc))
+    await c.feedEncrypted()
+
+proc writePlain*(c: WolfTlsConnection, data: seq[byte]): Future[void] {.async: (raises: [TransportError, CancelledError, WolfTlsError]).} =
+  await c.ensureHandshake()
+  var offset = 0
+  while offset < data.len:
+    let rc = c.session.writePlainStep(data.toOpenArray(offset, data.len - 1))
+    await c.flushOutput()
+    if rc > 0:
+      offset += rc
+    elif rc < 0:
+      if -rc == WolfSslErrorZeroReturn:
+        raise newException(WolfTlsClosedError, "TLS peer closed connection")
+      raise newException(WolfTlsError, "wolfSSL_write failed: " & $(-rc))
+    else:
+      await c.feedEncrypted()
