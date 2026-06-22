@@ -152,7 +152,7 @@ proc handleAuth(app: AppContext, ws: WSSession, req: JsonNode): Future[void] {.a
 
   app.db.deleteAuthToken(token)
   let loginToken = generateRandomString(128)
-  app.db.insertSessionToken(phone, loginToken, "WEB", "WebSocket", "Localhost Federation", nowUnixMs())
+  app.db.insertSessionToken(phone, loginToken, "WEB", "WebSocket", "Yggdrasil Federation", nowUnixMs())
   await ws.sendOk(req, AuthOpcode.int, %*{
     "tokenAttrs": {"LOGIN": {"token": loginToken}},
     "profile": profileJson(user)
@@ -180,7 +180,7 @@ proc handleAuthConfirm(app: AppContext, ws: WSSession, req: JsonNode): Future[vo
   let user = app.db.createOnemeUser(phone, firstName, lastName)
   app.db.deleteAuthToken(token)
   let loginToken = generateRandomString(128)
-  app.db.insertSessionToken(phone, loginToken, "WEB", "WebSocket", "Localhost Federation", nowUnixMs())
+  app.db.insertSessionToken(phone, loginToken, "WEB", "WebSocket", "Yggdrasil Federation", nowUnixMs())
   await ws.sendOk(req, AuthConfirmOpcode.int, %*{
     "userToken": rowInt64(user, "id"),
     "profile": profileJson(user),
@@ -256,7 +256,14 @@ proc handleOnemeWebSocket*(app: AppContext, ws: WSSession, peer: string): Future
           continue
       await handleWsFrame(app, ws, req, state)
   except WebSocketError as exc:
-    safeInfo(&"[oneme/ws] websocket error peer={peer}: {exc.msg}")
+    # Some clients close the socket with a close payload that nim-websock rejects
+    # while parsing the optional close reason. Treat that as a normal disconnect:
+    # the application protocol has already finished and there is no server-side
+    # action required.
+    if exc.msg.contains("Invalid UTF8 sequence detected in close reason"):
+      safeInfo(&"[oneme/ws] websocket close peer={peer}: invalid/empty close reason")
+    else:
+      safeInfo(&"[oneme/ws] websocket error peer={peer}: {exc.msg}")
   except CatchableError as exc:
     safeInfo(&"[oneme/ws] handler error peer={peer}: {exc.msg}")
   finally:
