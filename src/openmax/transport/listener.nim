@@ -11,6 +11,7 @@ import ../tls/wolf_tls
 import ../tls/wolf_asyncstream
 import ../protocols/router
 import ../protocols/oneme/ws_handler
+import ../protocols/calls_http
 
 type
   ListenerRuntime* = ref object
@@ -63,7 +64,9 @@ proc handleTcpClient(runtime: ListenerRuntime,
           safeWarn(&"[transport] tcp TLS requested but cert/key not found: cert={certPath} key={keyPath}")
           await rawTransp.closeWait()
           return
-        newTlsMobileTransport(rawTransp, newWolfTlsContext(certPath, keyPath))
+        let minVer = runtime.app.config.tls.min_version
+        let maxVer = runtime.app.config.tls.max_version
+        newTlsMobileTransport(rawTransp, newWolfTlsContext(certPath, keyPath, minVer, maxVer))
       else:
         newPlainMobileTransport(rawTransp)
     except CatchableError as exc:
@@ -200,9 +203,12 @@ proc serveWolfWebSocket(runtime: ListenerRuntime,
     safeWarn(&"[transport] websocket TLS requested but cert/key not found: cert={certPath} key={keyPath}")
     return
 
+  let minVer = runtime.app.config.tls.min_version
+  let maxVer = runtime.app.config.tls.max_version
+
   let wolfCtx =
     try:
-      newWolfTlsContext(certPath, keyPath)
+      newWolfTlsContext(certPath, keyPath, minVer, maxVer)
     except CatchableError as exc:
       safeWarn(&"[transport] failed to initialize wolfSSL websocket context: {exc.msg}")
       return
@@ -256,7 +262,10 @@ proc serveWebSocket(runtime: ListenerRuntime): Future[void] {.async: (raises: [C
     return
 
   proc handleRequest(request: HttpRequest) {.async.} =
-    await handleWebSocketRequest(runtime, request, "ws-peer")
+    if request.uri.path == "/fb.do":
+      await handleCallsHttp(runtime.app, request)
+    else:
+      await handleWebSocketRequest(runtime, request, "ws-peer")
 
   let server =
     try:

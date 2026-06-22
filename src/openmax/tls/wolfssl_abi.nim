@@ -24,7 +24,12 @@ const
   WolfSslErrorZeroReturn* = 6.cint
 
   ## wolfSSL protocol version enum value.
+  WolfSslTlsV12* = 3.cint
   WolfSslTlsV13* = 4.cint
+
+  ## OpenSSL compatibility protocol version values.
+  OsslTlsV12* = 0x0303.cint
+  OsslTlsV13* = 0x0304.cint
 
 type
   WolfSslCtx* = object
@@ -47,6 +52,7 @@ proc wolfTLS_server_method*(): WolfSslMethodPtr {.importc, dynlib: WolfSslDynLib
 proc wolfSSL_CTX_new*(tlsMethod: WolfSslMethodPtr): WolfSslCtxPtr {.importc, dynlib: WolfSslDynLib.}
 proc wolfSSL_CTX_free*(ctx: WolfSslCtxPtr) {.importc, dynlib: WolfSslDynLib.}
 proc wolfSSL_CTX_SetMinVersion*(ctx: WolfSslCtxPtr, version: cint): cint {.importc, dynlib: WolfSslDynLib.}
+proc wolfSSL_CTX_set_max_proto_version*(ctx: WolfSslCtxPtr, version: cint): cint {.importc, dynlib: WolfSslDynLib.}
 proc wolfSSL_CTX_use_certificate_file*(ctx: WolfSslCtxPtr, file: cstring, filetype: cint): cint {.importc, dynlib: WolfSslDynLib.}
 proc wolfSSL_CTX_use_PrivateKey_file*(ctx: WolfSslCtxPtr, file: cstring, filetype: cint): cint {.importc, dynlib: WolfSslDynLib.}
 proc wolfSSL_CTX_SetIORecv*(ctx: WolfSslCtxPtr, cb: WolfSslIoRecvCb) {.importc, dynlib: WolfSslDynLib.}

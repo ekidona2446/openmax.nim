@@ -65,7 +65,17 @@ proc wolfSendCb(ssl: WolfSslPtr, buf: pointer, sz: cint, ctx: pointer): cint {.c
     return WolfSslCbioErrGeneral
   cint(session.appendOutput(buf, int(sz)))
 
-proc newWolfTlsContext*(certFile, keyFile: string): WolfTlsContext =
+proc parseTlsVersion(v: string, def: cint): cint =
+  if v == "1.2": return WolfSslTlsV12
+  if v == "1.3": return WolfSslTlsV13
+  return def
+
+proc parseOsslTlsVersion(v: string, def: cint): cint =
+  if v == "1.2": return OsslTlsV12
+  if v == "1.3": return OsslTlsV13
+  return def
+
+proc newWolfTlsContext*(certFile, keyFile, minVer, maxVer: string): WolfTlsContext =
   if not fileExists(certFile):
     raiseWolf("wolfSSL certificate file not found: " & certFile)
   if not fileExists(keyFile):
@@ -74,17 +84,23 @@ proc newWolfTlsContext*(certFile, keyFile: string): WolfTlsContext =
   if wolfSSL_Init() != 1:
     raiseWolf("wolfSSL_Init failed")
 
-  let tlsMethod = wolfTLSv1_3_server_method()
+  let tlsMethod = wolfTLS_server_method()
   if tlsMethod.isNil:
-    raiseWolf("wolfTLSv1_3_server_method returned nil; is wolfSSL built with TLS 1.3?")
+    raiseWolf("wolfTLS_server_method returned nil; is wolfSSL built correctly?")
 
   let rawCtx = wolfSSL_CTX_new(tlsMethod)
   if rawCtx.isNil:
     raiseWolf("wolfSSL_CTX_new failed")
 
-  if wolfSSL_CTX_SetMinVersion(rawCtx, WolfSslTlsV13) != 1:
+  let cMinVer = parseTlsVersion(minVer, WolfSslTlsV12)
+  if wolfSSL_CTX_SetMinVersion(rawCtx, cMinVer) != 1:
     wolfSSL_CTX_free(rawCtx)
-    raiseWolf("wolfSSL_CTX_SetMinVersion(TLS1.3) failed")
+    raiseWolf("wolfSSL_CTX_SetMinVersion failed")
+
+  let cMaxVer = parseOsslTlsVersion(maxVer, OsslTlsV13)
+  if wolfSSL_CTX_set_max_proto_version(rawCtx, cMaxVer) != 1:
+    wolfSSL_CTX_free(rawCtx)
+    raiseWolf("wolfSSL_CTX_set_max_proto_version failed")
 
   if wolfSSL_CTX_use_certificate_file(rawCtx, certFile.cstring, WolfSslFiletypePem) != 1:
     wolfSSL_CTX_free(rawCtx)

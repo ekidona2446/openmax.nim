@@ -8,6 +8,8 @@ type
     enabled*: bool
     cert_file*: string
     key_file*: string
+    min_version*: string
+    max_version*: string
 
   DatabaseConfig* = object
     kind*: string
