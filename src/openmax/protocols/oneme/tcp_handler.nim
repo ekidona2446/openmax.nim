@@ -13,6 +13,8 @@ import ../../proto/msgpack_codec
 import ../errors
 import ../auth_utils
 import ../profile_payloads
+import ../server_config_data
+import ../uploads_http
 
 type
   OnemeUserAgent = object
@@ -274,6 +276,21 @@ proc safeInfo(message: string) =
   except Exception:
     discard
 
+proc jsonInt64(node: JsonNode, key: string, defaultValue = 0'i64): int64 =
+  if node.kind == JObject and node.hasKey(key):
+    try: return node[key].getBiggestInt().int64
+    except CatchableError: discard
+  defaultValue
+
+proc jsonObj(node: JsonNode, key: string): JsonNode =
+  if node.kind == JObject and node.hasKey(key): node[key] else: newJObject()
+
+proc jsonArrayOrEmpty(node: JsonNode, key: string): JsonNode =
+  if node.kind == JObject and node.hasKey(key) and node[key].kind == JArray:
+    node[key]
+  else:
+    newJArray()
+
 proc emptyReactionInfo(): OnemeReactionInfoPayload =
   OnemeReactionInfoPayload(totalCount: 0, counters: @[])
 
@@ -307,6 +324,75 @@ proc messageFromRow(row: DbRow): OnemeMessagePayload =
     elements: @[],
     reactionInfo: emptyReactionInfo()
   )
+
+
+proc jsonFromStored(value: string, fallback: JsonNode): JsonNode =
+  try:
+    parseJson(value)
+  except CatchableError:
+    fallback
+
+
+proc normalizeAttach(a: JsonNode): JsonNode =
+  if a.kind != JObject:
+    return a
+  let typ = a{"_type"}.getStr(a{"type"}.getStr(""))
+  case typ
+  of "FILE":
+    result = copy(a)
+    if not result.hasKey("_type"): result["_type"] = %"FILE"
+    if not result.hasKey("name"): result["name"] = %"file"
+    if not result.hasKey("size"): result["size"] = %0
+    if not result.hasKey("token"): result["token"] = %""
+  of "PHOTO":
+    result = copy(a)
+    if not result.hasKey("_type"): result["_type"] = %"PHOTO"
+    if not result.hasKey("baseUrl"): result["baseUrl"] = %""
+    if not result.hasKey("height"): result["height"] = %0
+    if not result.hasKey("width"): result["width"] = %0
+    if not result.hasKey("photoId"): result["photoId"] = %0
+    if not result.hasKey("photoToken"):
+      result["photoToken"] = %a{"photo_token"}.getStr("")
+  of "VIDEO":
+    result = copy(a)
+    if not result.hasKey("_type"): result["_type"] = %"VIDEO"
+    if not result.hasKey("height"): result["height"] = %0
+    if not result.hasKey("width"): result["width"] = %0
+    if not result.hasKey("duration"): result["duration"] = newJNull()
+    if not result.hasKey("previewData"): result["previewData"] = %""
+    if not result.hasKey("thumbnail"): result["thumbnail"] = %""
+    if not result.hasKey("token"): result["token"] = %""
+    if not result.hasKey("videoType"): result["videoType"] = %0
+  else:
+    result = a
+
+proc normalizeAttaches(node: JsonNode): JsonNode =
+  result = newJArray()
+  if node.kind != JArray:
+    return
+  for item in node.items:
+    result.add normalizeAttach(item)
+
+proc messageJsonFromRow(row: DbRow): JsonNode =
+  if row.len == 0:
+    return %*{
+      "id": 0, "chatId": 0, "sender": 0, "text": "", "time": 0,
+      "type": "USER", "cid": 0, "attaches": [], "elements": [],
+      "reactionInfo": {"totalCount": 0, "counters": []}
+    }
+
+  %*{
+    "id": rowInt64(row, "id"),
+    "chatId": rowInt64(row, "chat_id"),
+    "sender": rowInt64(row, "sender"),
+    "text": rowString(row, "text"),
+    "time": rowInt64(row, "time"),
+    "type": rowString(row, "type"),
+    "cid": rowInt64(row, "cid"),
+    "attaches": normalizeAttaches(jsonFromStored(rowString(row, "attaches"), newJArray())),
+    "elements": jsonFromStored(rowString(row, "elements"), newJArray()),
+    "reactionInfo": {"totalCount": 0, "counters": []}
+  }
 
 proc participantsTable(ids: openArray[int64]): Table[string, int] =
   result = initTable[string, int]()
@@ -433,12 +519,13 @@ proc handleSessionInit(ctx: ConnectionContext,
   ctx.deviceType = payload.userAgent.deviceType
   ctx.deviceName = payload.userAgent.deviceName
   ctx.appVersion = payload.userAgent.appVersion
+  let country = countryFromUserAgent(payload.userAgent.locale, payload.userAgent.deviceLocale, "RU")
 
   let response = OnemeSessionInitResponse(
     callsSeed: nowUnixMs(),
-    location: "RU",
+    location: country,
     `app-update-type`: 0,
-    `reg-country-code`: @["RU"],
+    `reg-country-code`: @[country],
     `phone-auto-complete-enabled`: false,
     `qr-auth-enabled`: false,
     lang: true
@@ -530,7 +617,7 @@ proc handleAuth(ctx: ConnectionContext,
     loginToken,
     deviceTypeOrDefault(ctx),
     deviceNameOrDefault(ctx),
-    "Yggdrasil Federation",
+    countryFromPhone(phone),
     nowUnixMs()
   )
 
@@ -574,7 +661,7 @@ proc handleAuthConfirm(ctx: ConnectionContext,
     loginToken,
     deviceTypeOrDefault(ctx),
     deviceNameOrDefault(ctx),
-    "Yggdrasil Federation",
+    countryFromPhone(phone),
     nowUnixMs()
   )
 
@@ -630,6 +717,19 @@ proc handleLogin(ctx: ConnectionContext,
 
   await transp.sendResponseObject(frame, CmdOk, LoginOpcode, response)
 
+
+proc handleLogout(ctx: ConnectionContext,
+                  transp: MobileTransport,
+                  frame: MobileFrame): Future[void] {.async.} =
+  if ctx.currentSessionToken.len > 0:
+    ctx.app.db.deleteSessionToken(ctx.currentSessionToken)
+  if ctx.currentUserId != 0:
+    ctx.app.detachClient(ctx.currentUserId, transp)
+  ctx.currentPhone = ""
+  ctx.currentUserId = 0
+  ctx.currentSessionToken = ""
+  await transp.sendNilResponse(frame, CmdOk, LogoutOpcode)
+
 proc handlePing(transp: MobileTransport,
                 frame: MobileFrame): Future[void] {.async.} =
   if frame.payload.len > 0:
@@ -644,6 +744,36 @@ proc handlePing(transp: MobileTransport,
 proc handleLog(transp: MobileTransport,
                frame: MobileFrame): Future[void] {.async.} =
   await transp.sendNilResponse(frame, CmdOk, LogOpcode)
+
+
+proc handleConfig(ctx: ConnectionContext,
+                  transp: MobileTransport,
+                  frame: MobileFrame): Future[void] {.async.} =
+  if not await requireLoggedIn(ctx, transp, frame, ConfigOpcode):
+    return
+
+  let payload =
+    try:
+      unpackJsonPayload(frame.payload)
+    except MsgPackCodecError:
+      newJObject()
+
+  if payload.kind == JObject and payload.hasKey("pushToken"):
+    ctx.app.db.updateSessionPushToken(ctx.currentPhone, ctx.currentSessionToken, payload{"pushToken"}.getStr(""))
+
+  let userData = ctx.app.db.findUserDataByPhone(ctx.currentPhone)
+  let userConfig =
+    try:
+      parseJson(rowString(userData, "user_config"))
+    except CatchableError:
+      parseJson(DefaultUserSettingsJson)
+
+  let response = %*{
+    "hash": "0",
+    "server": parseJson(OnemeServerConfigJson),
+    "user": userConfig
+  }
+  await transp.sendResponseBytes(frame, CmdOk, ConfigOpcode, packJsonPayload(response))
 
 proc handleSessionsInfo(ctx: ConnectionContext,
                         transp: MobileTransport,
@@ -662,7 +792,7 @@ proc handleSessionsInfo(ctx: ConnectionContext,
       deviceType: deviceTypeOrDefault(ctx),
       platform: deviceTypeOrDefault(ctx),
       ip: ctx.peer,
-      location: "RU",
+      location: countryFromPhone(ctx.currentPhone),
       created: now,
       updated: now,
       lastActivity: now
@@ -752,21 +882,27 @@ proc handleSendMessage(ctx: ConnectionContext,
 
   let payload =
     try:
-      unpackMapPayload(frame.payload, OnemeSendMessagePayload)
+      unpackJsonPayload(frame.payload)
     except MsgPackCodecError:
       await transp.sendErrorResponse(frame, MsgSendOpcode, invalidPayloadError())
       return
 
-  if payload.message.text.len == 0 and payload.message.attaches.len == 0:
+  let message = payload.jsonObj("message")
+  let text = message{"text"}.getStr("")
+  let attachesNode = normalizeAttaches(message.jsonArrayOrEmpty("attaches"))
+  let elementsNode = message.jsonArrayOrEmpty("elements")
+  if text.len == 0 and attachesNode.len == 0:
     await transp.sendErrorResponse(frame, MsgSendOpcode, invalidPayloadError())
     return
 
-  let chatId = storageChatIdFor(ctx, payload.chatId, payload.userId)
+  let requestedChatId = payload.jsonInt64("chatId")
+  let targetUserId = payload.jsonInt64("userId")
+  let chatId = storageChatIdFor(ctx, requestedChatId, targetUserId)
   if ctx.app.db.findChatById(chatId).len == 0:
     if chatId == ctx.currentUserId:
       ctx.app.db.ensureChat(chatId, ctx.currentUserId, "DIALOG", [ctx.currentUserId])
-    elif payload.userId != 0:
-      ctx.app.db.ensureChat(chatId, ctx.currentUserId, "DIALOG", [ctx.currentUserId, payload.userId])
+    elif targetUserId != 0:
+      ctx.app.db.ensureChat(chatId, ctx.currentUserId, "DIALOG", [ctx.currentUserId, targetUserId])
     else:
       await transp.sendErrorResponse(frame, MsgSendOpcode, notImplementedError())
       return
@@ -779,23 +915,25 @@ proc handleSendMessage(ctx: ConnectionContext,
   let row = ctx.app.db.insertMessage(
     chatId,
     ctx.currentUserId,
-    payload.message.cid,
-    payload.message.text,
-    "[]",
-    "[]",
+    message.jsonInt64("cid"),
+    text,
+    $attachesNode,
+    $elementsNode,
     "USER",
     nowUnixMs()
   )
 
-  let response = messageFromRow(row)
-  await transp.sendResponseObject(frame, CmdOk, MsgSendOpcode, response)
+  let response = messageJsonFromRow(row)
+  await transp.sendResponseBytes(frame, CmdOk, MsgSendOpcode, packJsonPayload(response))
 
+  let eventBytes = packJsonPayload(response)
+  let msgId = rowInt64(row, "id")
   for participant in participants:
     for client in ctx.app.transportsForUser(participant):
       try:
-        await client.sendResponseObject(frame, 0'u8, NotifMessageOpcode, response)
+        await client.sendResponseBytes(frame, 0'u8, NotifMessageOpcode, eventBytes)
       except CatchableError as exc:
-        safeInfo(&"[oneme/tcp] failed to fan-out message id={response.id} to user={participant}: {exc.msg}")
+        safeInfo(&"[oneme/tcp] failed to fan-out message id={msgId} to user={participant}: {exc.msg}")
 
 proc handleEditMessage(ctx: ConnectionContext,
                        transp: MobileTransport,
@@ -968,15 +1106,15 @@ proc handleChatHistory(ctx: ConnectionContext,
 
   let chatId = if payload.chatId == 0: ctx.currentUserId else: payload.chatId
   if ctx.app.db.findChatById(chatId).len == 0 or ctx.currentUserId notin ctx.app.db.participantsOfChat(chatId):
-    await transp.sendResponseObject(frame, CmdOk, ChatHistoryOpcode, OnemeMessagesListResponse(messages: @[]))
+    await transp.sendResponseBytes(frame, CmdOk, ChatHistoryOpcode, packJsonPayload(%*{"messages": []}))
     return
 
   let limit = max(1, max(payload.backward, payload.forward))
-  var messages: seq[OnemeMessagePayload] = @[]
+  var messages = newJArray()
   for row in ctx.app.db.messagesForChat(chatId, limit):
-    messages.add messageFromRow(row)
+    messages.add messageJsonFromRow(row)
 
-  await transp.sendResponseObject(frame, CmdOk, ChatHistoryOpcode, OnemeMessagesListResponse(messages: messages))
+  await transp.sendResponseBytes(frame, CmdOk, ChatHistoryOpcode, packJsonPayload(%*{"messages": messages}))
 
 proc handleGetMessages(ctx: ConnectionContext,
                        transp: MobileTransport,
@@ -992,12 +1130,24 @@ proc handleGetMessages(ctx: ConnectionContext,
       return
 
   let chatId = if payload.chatId == 0: ctx.currentUserId else: payload.chatId
-  var messages: seq[OnemeMessagePayload] = @[]
+  var messages = newJArray()
   if ctx.currentUserId in ctx.app.db.participantsOfChat(chatId):
     for row in ctx.app.db.messagesByIds(chatId, payload.messageIds):
-      messages.add messageFromRow(row)
+      messages.add messageJsonFromRow(row)
 
-  await transp.sendResponseObject(frame, CmdOk, MsgGetOpcode, OnemeMessagesListResponse(messages: messages))
+  await transp.sendResponseBytes(frame, CmdOk, MsgGetOpcode, packJsonPayload(%*{"messages": messages}))
+
+
+proc handleUploadRequest(ctx: ConnectionContext,
+                         transp: MobileTransport,
+                         frame: MobileFrame,
+                         opcode: uint16,
+                         kind: string): Future[void] {.async.} =
+  if not await requireLoggedIn(ctx, transp, frame, opcode):
+    return
+  let payload = ctx.app.uploadRequestPayload("oneme", kind, ctx.currentUserId)
+  safeInfo(&"[oneme/tcp] upload request kind={kind} payload={$payload}")
+  await transp.sendResponseBytes(frame, CmdOk, opcode, packJsonPayload(payload))
 
 proc handleCallsToken(ctx: ConnectionContext,
                       transp: MobileTransport,
@@ -1144,8 +1294,12 @@ proc handleTcpFrame*(ctx: ConnectionContext,
     await handleAuthConfirm(ctx, transp, frame)
   of LoginOpcode:
     await handleLogin(ctx, transp, frame)
+  of LogoutOpcode:
+    await handleLogout(ctx, transp, frame)
   of SessionsInfoOpcode:
     await handleSessionsInfo(ctx, transp, frame)
+  of ConfigOpcode:
+    await handleConfig(ctx, transp, frame)
   of FoldersGetOpcode:
     await handleFoldersGet(transp, frame)
   of ChatsListOpcode:
@@ -1168,6 +1322,12 @@ proc handleTcpFrame*(ctx: ConnectionContext,
     await handleChatHistory(ctx, transp, frame)
   of MsgGetOpcode:
     await handleGetMessages(ctx, transp, frame)
+  of PhotoUploadOpcode:
+    await handleUploadRequest(ctx, transp, frame, PhotoUploadOpcode, "photo")
+  of VideoUploadOpcode:
+    await handleUploadRequest(ctx, transp, frame, VideoUploadOpcode, "video")
+  of FileUploadOpcode:
+    await handleUploadRequest(ctx, transp, frame, FileUploadOpcode, "file")
   of ContactInfoOpcode:
     await handleContactInfo(ctx, transp, frame)
   of ContactUpdateOpcode:

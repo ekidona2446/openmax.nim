@@ -13,6 +13,7 @@ import ../errors
 type
   WsConnectionState = ref object
     currentUserId: int64
+    currentSessionToken: string
 
 proc safeInfo(message: string) =
   try:
@@ -78,7 +79,7 @@ proc profileJson(user: DbRow): JsonNode =
       }],
       "options": rowStringSeq(user, "options"),
       "accountStatus": rowInt64(user, "accountstatus").int,
-      "location": "RU",
+      "location": countryForUserRow(user),
       "registrationTime": nowUnixMs(),
       "description": rowString(user, "description"),
       "link": ""
@@ -87,11 +88,18 @@ proc profileJson(user: DbRow): JsonNode =
   }
 
 proc handleSessionInit(ws: WSSession, req: JsonNode): Future[void] {.async.} =
+  let payload = reqPayload(req)
+  let ua = payload{"userAgent"}
+  let country =
+    if ua.kind == JObject:
+      countryFromUserAgent(ua{"locale"}.getStr(""), ua{"deviceLocale"}.getStr(""), "RU")
+    else:
+      "RU"
   await ws.sendOk(req, SessionInitOpcode.int, %*{
     "callsSeed": nowUnixMs(),
-    "location": "RU",
+    "location": country,
     "app-update-type": 0,
-    "reg-country-code": ["RU"],
+    "reg-country-code": [country],
     "phone-auto-complete-enabled": false,
     "qr-auth-enabled": false,
     "lang": true
@@ -152,7 +160,7 @@ proc handleAuth(app: AppContext, ws: WSSession, req: JsonNode): Future[void] {.a
 
   app.db.deleteAuthToken(token)
   let loginToken = generateRandomString(128)
-  app.db.insertSessionToken(phone, loginToken, "WEB", "WebSocket", "Yggdrasil Federation", nowUnixMs())
+  app.db.insertSessionToken(phone, loginToken, "WEB", "WebSocket", countryFromPhone(phone), nowUnixMs())
   await ws.sendOk(req, AuthOpcode.int, %*{
     "tokenAttrs": {"LOGIN": {"token": loginToken}},
     "profile": profileJson(user)
@@ -180,7 +188,7 @@ proc handleAuthConfirm(app: AppContext, ws: WSSession, req: JsonNode): Future[vo
   let user = app.db.createOnemeUser(phone, firstName, lastName)
   app.db.deleteAuthToken(token)
   let loginToken = generateRandomString(128)
-  app.db.insertSessionToken(phone, loginToken, "WEB", "WebSocket", "Yggdrasil Federation", nowUnixMs())
+  app.db.insertSessionToken(phone, loginToken, "WEB", "WebSocket", countryFromPhone(phone), nowUnixMs())
   await ws.sendOk(req, AuthConfirmOpcode.int, %*{
     "userToken": rowInt64(user, "id"),
     "profile": profileJson(user),
@@ -202,12 +210,21 @@ proc handleLogin(app: AppContext, ws: WSSession, req: JsonNode, state: WsConnect
     return
 
   state.currentUserId = rowInt64(user, "id")
+  state.currentSessionToken = token
   await ws.sendOk(req, LoginOpcode.int, %*{
     "profile": profileJson(user),
     "token": token,
     "time": nowUnixMs(),
     "config": {"hash": "0"}
   })
+
+
+proc handleLogout(app: AppContext, ws: WSSession, req: JsonNode, state: WsConnectionState): Future[void] {.async.} =
+  if state.currentSessionToken.len > 0:
+    app.db.deleteSessionToken(state.currentSessionToken)
+  state.currentUserId = 0
+  state.currentSessionToken = ""
+  await ws.sendOk(req, LogoutOpcode.int, newJNull())
 
 proc handleCallsToken(ws: WSSession, req: JsonNode, currentUserId: int64): Future[void] {.async.} =
   if currentUserId == 0:
@@ -234,13 +251,15 @@ proc handleWsFrame(app: AppContext, ws: WSSession, req: JsonNode, state: WsConne
     await handleAuthConfirm(app, ws, req)
   of LoginOpcode:
     await handleLogin(app, ws, req, state)
+  of LogoutOpcode:
+    await handleLogout(app, ws, req, state)
   of CallsTokenOpcode:
     await handleCallsToken(ws, req, state.currentUserId)
   else:
     await ws.sendErr(req, opcode, notImplementedError())
 
 proc handleOnemeWebSocket*(app: AppContext, ws: WSSession, peer: string): Future[void] {.async.} =
-  let state = WsConnectionState(currentUserId: 0)
+  let state = WsConnectionState(currentUserId: 0, currentSessionToken: "")
   safeInfo(&"[oneme/ws] connected peer={peer}")
   try:
     while ws.readyState != ReadyState.Closed:

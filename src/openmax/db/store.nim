@@ -150,6 +150,22 @@ proc findSessionToken*(db: AppDatabase, token: string): DbRow =
     [textValue(sha256Hex(token))]
   )
 
+proc deleteSessionToken*(db: AppDatabase, token: string) =
+  if token.len == 0:
+    return
+  db.sqlite.exec(
+    "DELETE FROM tokens WHERE token_hash = ?",
+    [textValue(sha256Hex(token))]
+  )
+
+proc updateSessionPushToken*(db: AppDatabase, phone, token, pushToken: string) =
+  if phone.len == 0 or token.len == 0:
+    return
+  db.sqlite.exec(
+    "UPDATE tokens SET push_token = ? WHERE phone = ? AND token_hash = ?",
+    [textValue(pushToken), textValue(phone), textValue(sha256Hex(token))]
+  )
+
 proc generateUserId*(db: AppDatabase): int64 =
   while true:
     let candidate = rand(2_147_383_647 - 100_000) + 100_000

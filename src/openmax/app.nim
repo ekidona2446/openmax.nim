@@ -65,6 +65,6 @@ proc run*(configPath: string): Future[void] {.async.} =
     safeInfo(&"[bootstrap] configured listener: {spec.describe()}")
     asyncSpawn newListenerRuntime(app, spec).start()
 
-  safeInfo("[bootstrap] placeholder app loop started")
+  safeInfo("[bootstrap] app loop started")
   while true:
     await sleepAsync(1.hours)

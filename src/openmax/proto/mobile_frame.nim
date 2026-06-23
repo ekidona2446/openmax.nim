@@ -30,6 +30,7 @@ type
     wolf*: WolfTlsSession
     tls*: bool
     handshakeDone*: bool
+    prebuf*: seq[byte]
 
 proc readUint16Be(data: openArray[byte], offset: int): uint16 =
   (uint16(data[offset]) shl 8) or uint16(data[offset + 1])
@@ -153,10 +154,10 @@ proc unpackFrame*(data: openArray[byte],
   )
 
 proc newPlainMobileTransport*(transp: StreamTransport): MobileTransport =
-  MobileTransport(raw: transp, tls: false, handshakeDone: true)
+  MobileTransport(raw: transp, tls: false, handshakeDone: true, prebuf: @[])
 
 proc newTlsMobileTransport*(transp: StreamTransport, ctx: WolfTlsContext): MobileTransport =
-  MobileTransport(raw: transp, wolf: newWolfTlsSession(ctx), tls: true, handshakeDone: false)
+  MobileTransport(raw: transp, wolf: newWolfTlsSession(ctx), tls: true, handshakeDone: false, prebuf: @[])
 
 proc flushWolfOutput(transp: MobileTransport): Future[void] {.async: (raises: [TransportError, CancelledError]).} =
   let outData = transp.wolf.takeOutput()
@@ -182,11 +183,38 @@ proc ensureHandshake(transp: MobileTransport): Future[void] {.
       raise newException(WolfTlsError, &"wolfSSL_accept failed: {-rc}")
     await transp.feedEncryptedByte()
 
+proc prependPlainBytes*(transp: MobileTransport, data: openArray[byte]) =
+  if data.len == 0:
+    return
+  var merged = newSeq[byte](data.len + transp.prebuf.len)
+  for i, b in data:
+    merged[i] = b
+  for i, b in transp.prebuf:
+    merged[data.len + i] = b
+  transp.prebuf = merged
+
+proc takePrebuf(transp: MobileTransport, dst: var seq[byte], offset: var int) =
+  while offset < dst.len and transp.prebuf.len > 0:
+    dst[offset] = transp.prebuf[0]
+    offset += 1
+    if transp.prebuf.len == 1:
+      transp.prebuf.setLen(0)
+    else:
+      transp.prebuf = transp.prebuf[1 .. ^1]
+
 proc readPlainN(transp: MobileTransport, nbytes: int): Future[seq[byte]] {.
   async: (raises: [TransportError, CancelledError, WolfTlsError]).} =
   await transp.ensureHandshake()
   result = newSeq[byte](nbytes)
   var offset = 0
+  transp.takePrebuf(result, offset)
+
+  if not transp.tls:
+    while offset < nbytes:
+      await transp.raw.readExactly(addr result[offset], nbytes - offset)
+      offset = nbytes
+    return
+
   while offset < nbytes:
     var tmp = newSeq[byte](nbytes - offset)
     let rc = transp.wolf.readPlainStep(tmp)
@@ -202,9 +230,18 @@ proc readPlainN(transp: MobileTransport, nbytes: int): Future[seq[byte]] {.
     else:
       await transp.feedEncryptedByte()
 
-proc writePlainBytes(transp: MobileTransport, src: seq[byte]) {.
+proc readPlainBytes*(transp: MobileTransport, nbytes: int): Future[seq[byte]] {.
+  async: (raises: [TransportError, CancelledError, WolfTlsError]).} =
+  await transp.readPlainN(nbytes)
+
+proc writePlainBytes*(transp: MobileTransport, src: seq[byte]) {.
   async: (raises: [TransportError, CancelledError, WolfTlsError]).} =
   await transp.ensureHandshake()
+  if not transp.tls:
+    if src.len > 0:
+      discard await transp.raw.write(src)
+    return
+
   var offset = 0
   while offset < src.len:
     let rc = transp.wolf.writePlainStep(src.toOpenArray(offset, src.len - 1))
@@ -238,9 +275,6 @@ proc readFrame*(transp: MobileTransport,
                 maxPayloadSize = DefaultMaxPayloadSize,
                 maxDecompressedSize = DefaultMaxDecompressedSize): Future[MobileFrame] {.
                   async: (raises: [MobileFrameError, TransportError, WolfTlsError, CancelledError]).} =
-  if not transp.tls:
-    return await transp.raw.readFrame(maxPayloadSize, maxDecompressedSize)
-
   let headerBytes = await transp.readPlainN(MobileHeaderSize)
 
   let header = decodeHeader(headerBytes, maxPayloadSize)

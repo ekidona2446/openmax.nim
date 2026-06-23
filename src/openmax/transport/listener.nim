@@ -11,7 +11,9 @@ import ../tls/wolf_tls
 import ../tls/wolf_asyncstream
 import ../protocols/router
 import ../protocols/oneme/ws_handler
+import ../protocols/tamtam/ws_handler
 import ../protocols/calls_http
+import ../protocols/uploads_http
 
 type
   ListenerRuntime* = ref object
@@ -49,6 +51,9 @@ proc parseDualStackMode(value: string): DualStackType =
 proc resolveTlsPath(path: string): string =
   if path.isAbsolute(): path else: getCurrentDir() / path
 
+proc isHttpFirstByte(b: byte): bool =
+  char(b) in {'G', 'P', 'H', 'O', 'D', 'T', 'C'}
+
 proc handleTcpClient(runtime: ListenerRuntime,
                      rawTransp: StreamTransport): Future[void] {.async: (raises: []).} =
   let peer = peerLabel(rawTransp)
@@ -75,6 +80,13 @@ proc handleTcpClient(runtime: ListenerRuntime,
       return
 
   try:
+    let first = await transp.readPlainBytes(1)
+    if first.len > 0 and isHttpFirstByte(first[0]):
+      safeInfo(&"[transport] tcp HTTP upload on api port: {runtime.spec.protocol} {peer}")
+      await runtime.app.handleUploadMobile(transp, first)
+      return
+    transp.prependPlainBytes(first)
+
     while true:
       let frame = await transp.readFrame()
       await dispatchTcpFrame(ctx, transp, frame)
@@ -166,8 +178,7 @@ proc handleWebSocketRequest(runtime: ListenerRuntime, request: HttpRequest, peer
     of pkOneme:
       await runtime.app.handleOnemeWebSocket(ws, peer)
     of pkTamtam:
-      safeWarn(&"[transport] tamtam websocket handler is not implemented yet: peer={peer}")
-      await ws.close()
+      await runtime.app.handleTamtamWebSocket(ws, peer)
   except WebSocketError as exc:
     safeWarn(&"[transport] websocket error on {runtime.spec.describe()} peer={peer}: {exc.msg}")
   except CatchableError as exc:
@@ -180,7 +191,12 @@ proc handleWolfWebSocketClient(runtime: ListenerRuntime,
   try:
     let stream = newWolfAsyncStream(rawTransp, wolfCtx)
     let request = await wshttpserver.readHttpRequest(stream, 10.seconds)
-    await handleWebSocketRequest(runtime, request, peer)
+    if request.uri.path.startsWith("/upload/"):
+      await handleUploadHttp(runtime.app, request)
+    elif request.uri.path == "/fb.do":
+      await handleCallsHttp(runtime.app, request)
+    else:
+      await handleWebSocketRequest(runtime, request, peer)
     await stream.closeWait()
   except WolfTlsClosedError:
     safeInfo(&"[transport] websocket tls client disconnected: {runtime.spec.protocol} {peer}")
@@ -262,7 +278,9 @@ proc serveWebSocket(runtime: ListenerRuntime): Future[void] {.async: (raises: [C
     return
 
   proc handleRequest(request: HttpRequest) {.async.} =
-    if request.uri.path == "/fb.do":
+    if request.uri.path.startsWith("/upload/"):
+      await handleUploadHttp(runtime.app, request)
+    elif request.uri.path == "/fb.do":
       await handleCallsHttp(runtime.app, request)
     else:
       await handleWebSocketRequest(runtime, request, "ws-peer")

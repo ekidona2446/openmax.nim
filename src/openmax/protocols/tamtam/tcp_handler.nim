@@ -1,7 +1,8 @@
-import std/[logging, strformat, strutils, tables]
+import std/[logging, strformat, strutils, tables, json]
 import chronos
 import msgpack4nim
 import ../../core/connection_context
+import ../../core/app_context
 import ../../core/opcodes
 import ../../crypto/sha256
 import ../../db/store
@@ -11,6 +12,8 @@ import ../../proto/msgpack_codec
 import ../errors
 import ../auth_utils
 import ../profile_payloads
+import ../server_config_data
+import ../uploads_http
 
 type
   TamtamUserAgent = object
@@ -156,12 +159,13 @@ proc handleSessionInit(ctx: ConnectionContext,
   ctx.deviceType = payload.userAgent.deviceType
   ctx.deviceName = payload.userAgent.deviceName
   ctx.appVersion = payload.userAgent.appVersion
+  let country = countryFromUserAgent(payload.userAgent.locale, payload.userAgent.deviceLocale, "RU")
 
   let response = TamtamSessionInitResponse(
     proxy: "",
     `logs-enabled`: false,
     `proxy-domains`: @[],
-    location: "RU",
+    location: country,
     `libh-enabled`: false,
     `phone-auto-complete-enabled`: false
   )
@@ -295,7 +299,7 @@ proc handleAuthConfirm(ctx: ConnectionContext,
     loginToken,
     deviceTypeOrDefault(ctx, payload.deviceType),
     deviceNameOrDefault(ctx),
-    "Yggdrasil Federation",
+    countryFromPhone(phone),
     nowUnixMs()
   )
 
@@ -335,6 +339,11 @@ proc handleLogin(ctx: ConnectionContext,
     await transp.sendErrorResponse(frame, LoginOpcode, userNotFoundError())
     return
 
+  ctx.currentPhone = phone
+  ctx.currentUserId = rowInt64(user, "id")
+  ctx.currentSessionToken = payload.token
+  ctx.app.attachClient(ctx.currentUserId, transp)
+
   let response = TamtamLoginResponse(
     profile: buildTamtamProfile(user),
     token: payload.token,
@@ -343,6 +352,69 @@ proc handleLogin(ctx: ConnectionContext,
   )
 
   await transp.sendResponseObject(frame, CmdOk, LoginOpcode, response)
+
+
+
+proc requireLoggedIn(ctx: ConnectionContext,
+                     transp: MobileTransport,
+                     frame: MobileFrame,
+                     opcode: uint16): Future[bool] {.async.} =
+  if ctx.currentUserId == 0:
+    await transp.sendErrorResponse(frame, opcode, invalidTokenError())
+    return false
+  true
+
+
+proc handleUploadRequest(ctx: ConnectionContext,
+                         transp: MobileTransport,
+                         frame: MobileFrame,
+                         opcode: uint16,
+                         kind: string): Future[void] {.async.} =
+  if not await requireLoggedIn(ctx, transp, frame, opcode):
+    return
+  let payload = ctx.app.uploadRequestPayload("tamtam", kind, ctx.currentUserId)
+  await transp.sendResponseBytes(frame, CmdOk, opcode, packJsonPayload(payload))
+
+proc handleConfig(ctx: ConnectionContext,
+                  transp: MobileTransport,
+                  frame: MobileFrame): Future[void] {.async.} =
+  if not await requireLoggedIn(ctx, transp, frame, ConfigOpcode):
+    return
+
+  let payload =
+    try:
+      unpackJsonPayload(frame.payload)
+    except MsgPackCodecError:
+      newJObject()
+
+  if payload.kind == JObject and payload.hasKey("pushToken"):
+    ctx.app.db.updateSessionPushToken(ctx.currentPhone, ctx.currentSessionToken, payload{"pushToken"}.getStr(""))
+
+  let userData = ctx.app.db.findUserDataByPhone(ctx.currentPhone)
+  let userConfig =
+    try:
+      parseJson(rowString(userData, "user_config"))
+    except CatchableError:
+      parseJson(DefaultUserSettingsJson)
+
+  let response = %*{
+    "hash": "0",
+    "server": parseJson(TamtamServerConfigJson),
+    "user": userConfig
+  }
+  await transp.sendResponseBytes(frame, CmdOk, ConfigOpcode, packJsonPayload(response))
+
+proc handleLogout(ctx: ConnectionContext,
+                  transp: MobileTransport,
+                  frame: MobileFrame): Future[void] {.async.} =
+  if ctx.currentSessionToken.len > 0:
+    ctx.app.db.deleteSessionToken(ctx.currentSessionToken)
+  if ctx.currentUserId != 0:
+    ctx.app.detachClient(ctx.currentUserId, transp)
+  ctx.currentPhone = ""
+  ctx.currentUserId = 0
+  ctx.currentSessionToken = ""
+  await transp.sendNilResponse(frame, CmdOk, LogoutOpcode)
 
 proc handlePing(transp: MobileTransport,
                 frame: MobileFrame): Future[void] {.async.} =
@@ -381,5 +453,15 @@ proc handleTcpFrame*(ctx: ConnectionContext,
     await handleAuthConfirm(ctx, transp, frame)
   of LoginOpcode:
     await handleLogin(ctx, transp, frame)
+  of LogoutOpcode:
+    await handleLogout(ctx, transp, frame)
+  of ConfigOpcode:
+    await handleConfig(ctx, transp, frame)
+  of PhotoUploadOpcode:
+    await handleUploadRequest(ctx, transp, frame, PhotoUploadOpcode, "photo")
+  of VideoUploadOpcode:
+    await handleUploadRequest(ctx, transp, frame, VideoUploadOpcode, "video")
+  of FileUploadOpcode:
+    await handleUploadRequest(ctx, transp, frame, FileUploadOpcode, "file")
   else:
     await transp.sendErrorResponse(frame, frame.header.opcode, notImplementedError())

@@ -59,7 +59,7 @@ proc buildOnemeProfile*(user: DbRow): OnemeProfilePayload =
       )],
       options: rowStringSeq(user, "options"),
       accountStatus: rowInt64(user, "accountstatus").int,
-      location: "RU",
+      location: countryForUserRow(user),
       registrationTime: currentRegistrationTime(),
       description: rowString(user, "description"),
       link: ""
