@@ -33,6 +33,19 @@ tamtam_tcp_port = 4433
 tamtam_ws_enabled = true
 tamtam_ws_port = 82
 
+[calls]
+enabled = true
+application_key = "CNHIJPLGDIHBABABA"
+signaling_host = ""
+signaling_port = 0
+signaling_path = "/websocket"
+turn_urls = ["turn:turn.openmax.su:3478"]
+turn_username = "openmax"
+turn_credential = "change-me"
+stun_urls = ["stun:stun.openmax.su:3478"]
+session_ttl_seconds = 3600
+token_ttl_seconds = 300
+
 [integrations]
 telegram_enabled = false
 telegram_token = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZ"
