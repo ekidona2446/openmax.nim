@@ -137,7 +137,7 @@ proc handleAuthRequest(app: AppContext, ws: WSSession, req: JsonNode): Future[vo
   let state = if existingUser.len == 0: "register" else: "started"
   let authToken = generateRandomString(128)
   let verifyCode = generateCode()
-  app.db.insertAuthToken(phone, authToken, verifyCode, nowUnix() + 300, state)
+  app.db.insertAuthToken(phone, authToken, verifyCode, store.nowUnix() + 300, state)
 
   await ws.sendOk(req, AuthRequestOpcode.int, %*{
     "verifyToken": authToken,

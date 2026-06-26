@@ -55,3 +55,27 @@ proc userNotFoundError*(): ErrorPayload =
     message: "User not found",
     title: "Не нашли этот номер, проверьте цифры"
   )
+
+proc contactBlockedError*(): ErrorPayload =
+  ErrorPayload(
+    localizedMessage: "Вы не можете написать этому пользователю",
+    error: "contact.blocked",
+    message: "Contact is blocked",
+    title: "Вы не можете написать этому пользователю"
+  )
+
+proc chatNotFoundError*(): ErrorPayload =
+  ErrorPayload(
+    localizedMessage: "Чат не найден",
+    error: "chat.not.found",
+    message: "Chat not found",
+    title: "Чат не найден"
+  )
+
+proc chatNotAccessError*(): ErrorPayload =
+  ErrorPayload(
+    localizedMessage: "Нет доступа к чату",
+    error: "chat.not.access",
+    message: "Chat not access",
+    title: "Нет доступа к чату"
+  )

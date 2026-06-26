@@ -195,7 +195,7 @@ proc handleAuthRequest(ctx: ConnectionContext,
   let state = if existingUser.len == 0: "register" else: "started"
   let authToken = generateRandomString(128)
   let verifyCode = generateCode()
-  let expires = nowUnix() + 300
+  let expires = store.nowUnix() + 300
 
   ctx.app.db.insertAuthToken(phone, authToken, verifyCode, expires, state)
 

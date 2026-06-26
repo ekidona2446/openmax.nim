@@ -15,6 +15,7 @@ import ../errors
 import ../auth_utils
 import ../profile_payloads
 import ../server_config_data
+import ../static_data
 import ../uploads_http
 
 type
@@ -143,6 +144,42 @@ type
 
   OnemeContactByPhonePayload = object
     phone: string
+
+  OnemeUpdateProfilePayload = object
+    description: string
+    firstName: string
+    lastName: string
+
+  OnemeAssetsGetPayload = object
+    `type`: string
+    count: int
+    query: string
+
+  OnemeAssetsGetByIdsPayload = object
+    `type`: string
+    ids: seq[string]
+
+  OnemeContactAddByPhonePayload = object
+    phone: string
+    firstName: string
+    lastName: string
+
+  OnemeContactPresencePayload = object
+    contactIds: seq[int64]
+
+  OnemeContactListPayload = object
+    status: string
+    count: int
+
+  OnemeChatSubscribePayload = object
+    chatId: int64
+    subscribe: bool
+
+  OnemeFullContactUpdatePayload = object
+    action: string
+    contactId: int64
+    firstName: string
+    lastName: string
 
   OnemeContactInfoPayload = object
     contactIds: seq[int64]
@@ -557,7 +594,7 @@ proc handleAuthRequest(ctx: ConnectionContext,
   let state = if existingUser.len == 0: "register" else: ""
   let authToken = generateRandomString(96)
   let verifyCode = generateCode()
-  let expires = nowUnix() + 300
+  let expires = store.nowUnix() + 300
 
   ctx.app.db.insertAuthToken(phone, authToken, verifyCode, expires, state)
 
@@ -763,11 +800,23 @@ proc handleConfig(ctx: ConnectionContext,
     ctx.app.db.updateSessionPushToken(ctx.currentPhone, ctx.currentSessionToken, payload{"pushToken"}.getStr(""))
 
   let userData = ctx.app.db.findUserDataByPhone(ctx.currentPhone)
-  let userConfig =
+  var userConfig =
     try:
       parseJson(rowString(userData, "user_config"))
     except CatchableError:
       parseJson(DefaultUserSettingsJson)
+
+  # Privacy-settings write path (ported from main.py update_config): merge the
+  # provided `settings.user` keys into the stored config and persist it.
+  if payload.kind == JObject and payload.hasKey("settings"):
+    let settings = payload["settings"]
+    if settings.kind == JObject and settings.hasKey("user") and settings["user"].kind == JObject:
+      if userConfig.kind != JObject:
+        userConfig = parseJson(DefaultUserSettingsJson)
+      for key, value in settings["user"]:
+        if userConfig.hasKey(key):
+          userConfig[key] = value
+      ctx.app.db.updateUserConfig(ctx.currentPhone, $userConfig)
 
   let response = %*{
     "hash": "0",
@@ -806,29 +855,36 @@ proc handleSessionsInfo(ctx: ConnectionContext,
     OnemeSessionsInfoResponse(sessions: sessions)
   )
 
-proc handleFoldersGet(transp: MobileTransport,
+proc handleFoldersGet(ctx: ConnectionContext,
+                      transp: MobileTransport,
                       frame: MobileFrame): Future[void] {.async.} =
-  let allFolder = OnemeFolderPayload(
-    id: "all.chat.folder",
-    title: "Все",
-    filters: @[],
-    updateTime: 0,
-    options: @[],
-    sourceId: 1,
-    `include`: @[]
-  )
+  ## FOLDERS_GET (272): sync folders from the DB. Ported from folders.py.
+  if not await requireLoggedIn(ctx, transp, frame, FoldersGetOpcode):
+    return
 
-  await transp.sendResponseObject(
-    frame,
-    CmdOk,
-    FoldersGetOpcode,
-    OnemeFoldersGetResponse(
-      folderSync: nowUnixMs(),
-      folders: @[allFolder],
-      foldersOrder: @["all.chat.folder"],
-      allFilterExcludeFolders: @[]
-    )
-  )
+  let phone = normalizePhone(ctx.currentPhone)
+  var folders = newJArray()
+  var order = newJArray()
+  for row in ctx.app.db.foldersForPhone(phone):
+    let id = rowString(row, "id")
+    folders.add %*{
+      "id": id,
+      "title": rowString(row, "title"),
+      "filters": jsonFromStored(rowString(row, "filters"), newJArray()),
+      "include": jsonFromStored(rowString(row, "include"), newJArray()),
+      "updateTime": rowInt64(row, "update_time"),
+      "options": jsonFromStored(rowString(row, "options"), newJArray()),
+      "sourceId": rowInt64(row, "source_id").int
+    }
+    order.add %id
+
+  let response = %*{
+    "folderSync": nowUnixMs(),
+    "folders": folders,
+    "foldersOrder": order,
+    "allFilterExcludeFolders": []
+  }
+  await transp.sendResponseBytes(frame, CmdOk, FoldersGetOpcode, packJsonPayload(response))
 
 proc handleChatsList(ctx: ConnectionContext,
                      transp: MobileTransport,
@@ -912,6 +968,15 @@ proc handleSendMessage(ctx: ConnectionContext,
   if ctx.currentUserId notin participants:
     await transp.sendErrorResponse(frame, MsgSendOpcode, invalidTokenError())
     return
+
+  # In a DIALOG, refuse to deliver if the recipient has blocked the sender
+  # (ported from messages.py: tools.contact_is_blocked check).
+  let chatRow = ctx.app.db.findChatById(chatId)
+  if rowString(chatRow, "type") == "DIALOG":
+    for other in participants:
+      if other != ctx.currentUserId and ctx.app.db.contactIsBlocked(other, ctx.currentUserId):
+        await transp.sendErrorResponse(frame, MsgSendOpcode, contactBlockedError())
+        return
 
   let row = ctx.app.db.insertMessage(
     chatId,
@@ -1182,62 +1247,125 @@ proc handleContactInfo(ctx: ConnectionContext,
       await transp.sendErrorResponse(frame, ContactInfoOpcode, invalidPayloadError())
       return
 
-  var contacts: seq[OnemeContactProfile] = @[]
+  ## CONTACT_INFO (32): lookup users by id, enriched with the requester's
+  ## custom names / block status. Ported from search.py::contact_info.
+  let avatarBase = ctx.app.config.service_urls.avatar_base_url
+  var contacts = newJArray()
   for userId in payload.contactIds:
     let user = ctx.app.db.findUserById(userId)
     if user.len != 0:
-      contacts.add buildOnemeProfile(user).contact
+      let crow = ctx.app.db.findContact(ctx.currentUserId, userId)
+      let blocked = crow.len != 0 and rowString(crow, "is_blocked") in ["1", "TRUE", "true"]
+      contacts.add generateOnemeProfileJson(
+        user, avatarBase, includeProfileOptions = false,
+        customFirstName = (if crow.len != 0: rowString(crow, "custom_firstname") else: ""),
+        customLastName = (if crow.len != 0: rowString(crow, "custom_lastname") else: ""),
+        blocked = blocked)
 
-  await transp.sendResponseObject(frame, CmdOk, ContactInfoOpcode, OnemeContactsResponse(contacts: contacts))
+  await transp.sendResponseBytes(frame, CmdOk, ContactInfoOpcode,
+    packJsonPayload(%*{"contacts": contacts}))
 
 proc handleContactUpdate(ctx: ConnectionContext,
                          transp: MobileTransport,
                          frame: MobileFrame): Future[void] {.async.} =
+  ## CONTACT_UPDATE (34): ADD / REMOVE / BLOCK / UNBLOCK / UPDATE.
+  ## Ported from contacts.py::contact_update.
   if not await requireLoggedIn(ctx, transp, frame, ContactUpdateOpcode):
     return
 
   let payload =
     try:
-      unpackMapPayload(frame.payload, OnemeContactUpdatePayload)
+      unpackMapPayload(frame.payload, OnemeFullContactUpdatePayload)
     except MsgPackCodecError:
       await transp.sendErrorResponse(frame, ContactUpdateOpcode, invalidPayloadError())
       return
 
-  let user = ctx.app.db.findUserById(payload.contactId)
-  if user.len == 0:
-    await transp.sendErrorResponse(frame, ContactUpdateOpcode, userNotFoundError())
-    return
+  let avatarBase = ctx.app.config.service_urls.avatar_base_url
+  let contactId = payload.contactId
+
+  proc contactProfileJson(user: DbRow): JsonNode =
+    generateOnemeProfileJson(
+      user, avatarBase, includeProfileOptions = false,
+      customFirstName = payload.firstName, customLastName = payload.lastName)
 
   case payload.action.toUpperAscii()
   of "ADD":
-    ctx.app.db.addContact(ctx.currentUserId, payload.contactId)
-    let chatId = ctx.currentUserId xor payload.contactId
-    ctx.app.db.ensureChat(chatId, ctx.currentUserId, "DIALOG", [ctx.currentUserId, payload.contactId])
-    await transp.sendResponseObject(
-      frame,
-      CmdOk,
-      ContactUpdateOpcode,
-      OnemeContactInfoByPhoneResponse(contact: buildOnemeProfile(user).contact)
-    )
+    let user = ctx.app.db.findUserById(contactId)
+    if user.len == 0:
+      await transp.sendErrorResponse(frame, ContactUpdateOpcode, userNotFoundError())
+      return
+    if ctx.app.db.findContact(ctx.currentUserId, contactId).len != 0:
+      await transp.sendErrorResponse(frame, ContactUpdateOpcode, invalidPayloadError())
+      return
+    ctx.app.db.addContactFull(ctx.currentUserId, contactId, payload.firstName, payload.lastName, false)
+    let chatId = ctx.currentUserId xor contactId
+    ctx.app.db.ensureChat(chatId, ctx.currentUserId, "DIALOG", [ctx.currentUserId, contactId])
+    await transp.sendResponseBytes(frame, CmdOk, ContactUpdateOpcode,
+      packJsonPayload(%*{"contact": contactProfileJson(user)}))
   of "REMOVE":
-    ctx.app.db.removeContact(ctx.currentUserId, payload.contactId)
-    await transp.sendResponseBytes(frame, CmdOk, ContactUpdateOpcode, packJsonPayload(%*{}))
+    ctx.app.db.removeContact(ctx.currentUserId, contactId)
+    await transp.sendNilResponse(frame, CmdOk, ContactUpdateOpcode)
+  of "BLOCK":
+    if ctx.app.db.findContact(ctx.currentUserId, contactId).len != 0:
+      ctx.app.db.setContactBlocked(ctx.currentUserId, contactId, true)
+    else:
+      let user = ctx.app.db.findUserById(contactId)
+      if user.len == 0:
+        await transp.sendErrorResponse(frame, ContactUpdateOpcode, userNotFoundError())
+        return
+      ctx.app.db.addContactFull(ctx.currentUserId, contactId, payload.firstName, payload.lastName, true)
+    await transp.sendNilResponse(frame, CmdOk, ContactUpdateOpcode)
+  of "UNBLOCK":
+    if ctx.app.db.findContact(ctx.currentUserId, contactId).len == 0:
+      await transp.sendErrorResponse(frame, ContactUpdateOpcode, userNotFoundError())
+      return
+    ctx.app.db.setContactBlocked(ctx.currentUserId, contactId, false)
+    await transp.sendNilResponse(frame, CmdOk, ContactUpdateOpcode)
+  of "UPDATE":
+    if ctx.app.db.findContact(ctx.currentUserId, contactId).len == 0:
+      await transp.sendErrorResponse(frame, ContactUpdateOpcode, userNotFoundError())
+      return
+    ctx.app.db.updateContactNames(ctx.currentUserId, contactId, payload.firstName, payload.lastName)
+    let user = ctx.app.db.findUserById(contactId)
+    if user.len == 0:
+      await transp.sendErrorResponse(frame, ContactUpdateOpcode, userNotFoundError())
+      return
+    await transp.sendResponseBytes(frame, CmdOk, ContactUpdateOpcode,
+      packJsonPayload(%*{"contact": contactProfileJson(user)}))
   else:
     await transp.sendErrorResponse(frame, ContactUpdateOpcode, invalidPayloadError())
 
 proc handleContactList(ctx: ConnectionContext,
                        transp: MobileTransport,
                        frame: MobileFrame): Future[void] {.async.} =
+  ## CONTACT_LIST (36). Ported from contacts.py::contact_list — the reference
+  ## server only returns a populated list for status == "BLOCKED"; all other
+  ## statuses respond with an empty contacts array.
   if not await requireLoggedIn(ctx, transp, frame, ContactListOpcode):
     return
 
-  var contacts: seq[OnemeContactProfile] = @[]
-  for userId in ctx.app.db.contactIdsForUser(ctx.currentUserId):
-    let user = ctx.app.db.findUserById(userId)
-    if user.len != 0:
-      contacts.add buildOnemeProfile(user).contact
+  let payload =
+    try:
+      unpackMapPayload(frame.payload, OnemeContactListPayload)
+    except MsgPackCodecError:
+      await transp.sendErrorResponse(frame, ContactListOpcode, invalidPayloadError())
+      return
 
-  await transp.sendResponseObject(frame, CmdOk, ContactListOpcode, OnemeContactsResponse(contacts: contacts))
+  let avatarBase = ctx.app.config.service_urls.avatar_base_url
+  var contacts = newJArray()
+  if payload.status.toUpperAscii() == "BLOCKED":
+    for row in ctx.app.db.blockedContactsForUser(ctx.currentUserId, payload.count):
+      let contactId = rowInt64(row, "contact_id")
+      let user = ctx.app.db.findUserById(contactId)
+      if user.len != 0:
+        contacts.add generateOnemeProfileJson(
+          user, avatarBase, includeProfileOptions = false,
+          customFirstName = rowString(row, "custom_firstname"),
+          customLastName = rowString(row, "custom_lastname"),
+          blocked = true)
+
+  await transp.sendResponseBytes(frame, CmdOk, ContactListOpcode,
+    packJsonPayload(%*{"contacts": contacts}))
 
 proc handleContactInfoByPhone(ctx: ConnectionContext,
                               transp: MobileTransport,
@@ -1267,12 +1395,279 @@ proc handleContactInfoByPhone(ctx: ConnectionContext,
     else:
       ctx.app.db.ensureChat(chatId, ctx.currentUserId, "DIALOG", [ctx.currentUserId, contactId])
 
-  await transp.sendResponseObject(
-    frame,
-    CmdOk,
-    ContactInfoByPhoneOpcode,
-    OnemeContactInfoByPhoneResponse(contact: buildOnemeProfile(user).contact)
+  let crow =
+    if ctx.currentUserId != 0: ctx.app.db.findContact(ctx.currentUserId, rowInt64(user, "id"))
+    else: initTable[string, string]()
+  let blocked = crow.len != 0 and rowString(crow, "is_blocked") in ["1", "TRUE", "true"]
+  let contact = generateOnemeProfileJson(
+    user, ctx.app.config.service_urls.avatar_base_url, includeProfileOptions = false,
+    customFirstName = (if crow.len != 0: rowString(crow, "custom_firstname") else: ""),
+    customLastName = (if crow.len != 0: rowString(crow, "custom_lastname") else: ""),
+    blocked = blocked)
+
+  await transp.sendResponseBytes(frame, CmdOk, ContactInfoByPhoneOpcode,
+    packJsonPayload(%*{"contact": contact}))
+
+proc handleProfile(ctx: ConnectionContext,
+                   transp: MobileTransport,
+                   frame: MobileFrame): Future[void] {.async.} =
+  ## PROFILE (16): return the logged-in user's own profile. Ported from
+  ## Python oneme/processors/main.py::profile (update path is a no-op stub here,
+  ## matching the reference server which only persists via separate flows).
+  if not await requireLoggedIn(ctx, transp, frame, ProfileOpcode):
+    return
+
+  let user = ctx.app.db.findUserById(ctx.currentUserId)
+  if user.len == 0:
+    await transp.sendErrorResponse(frame, ProfileOpcode, userNotFoundError())
+    return
+
+  let profile = generateOnemeProfileJson(
+    user,
+    ctx.app.config.service_urls.avatar_base_url,
+    includeProfileOptions = true
   )
+  await transp.sendResponseBytes(frame, CmdOk, ProfileOpcode, packJsonPayload(%*{"profile": profile}))
+
+proc handleAssetsUpdate(ctx: ConnectionContext,
+                        transp: MobileTransport,
+                        frame: MobileFrame): Future[void] {.async.} =
+  ## ASSETS_UPDATE (27): sticker store sync. Ported from assets.py — the
+  ## reference server returns an empty-but-structured sticker catalogue.
+  if not await requireLoggedIn(ctx, transp, frame, AssetsUpdateOpcode):
+    return
+  let response = %*{
+    "sync": nowUnixMs(),
+    "stickerSetsUpdates": newJObject(),
+    "stickersUpdates": newJObject(),
+    "stickersOrder": [
+      "RECENT", "FAVORITE_STICKERS", "FAVORITE_STICKER_SETS",
+      "TOP", "NEW", "NEW_STICKER_SETS"
+    ],
+    "sections": [
+      {"id": "RECENT", "type": "RECENTS", "recentsList": []},
+      {"id": "FAVORITE_STICKERS", "type": "STICKERS", "stickers": [], "marker": newJNull()},
+      {"id": "FAVORITE_STICKER_SETS", "type": "STICKER_SETS", "stickerSets": [], "marker": newJNull()},
+      {"id": "TOP", "type": "STICKERS", "stickers": [], "marker": newJNull()},
+      {"id": "NEW", "type": "STICKERS", "stickers": [], "marker": newJNull()},
+      {"id": "NEW_STICKER_SETS", "type": "STICKER_SETS", "stickerSets": [], "marker": newJNull()}
+    ]
+  }
+  await transp.sendResponseBytes(frame, CmdOk, AssetsUpdateOpcode, packJsonPayload(response))
+
+proc handleAssetsGet(ctx: ConnectionContext,
+                     transp: MobileTransport,
+                     frame: MobileFrame): Future[void] {.async.} =
+  ## ASSETS_GET (26). Ported from assets.py.
+  if not await requireLoggedIn(ctx, transp, frame, AssetsGetOpcode):
+    return
+  let payload =
+    try:
+      unpackMapPayload(frame.payload, OnemeAssetsGetPayload)
+    except MsgPackCodecError:
+      await transp.sendErrorResponse(frame, AssetsGetOpcode, invalidPayloadError())
+      return
+  let response =
+    if payload.`type` == "STICKER_SET":
+      %*{"stickerSets": [], "marker": newJNull()}
+    else:
+      %*{"stickers": [], "marker": newJNull()}
+  await transp.sendResponseBytes(frame, CmdOk, AssetsGetOpcode, packJsonPayload(response))
+
+proc handleAssetsGetByIds(ctx: ConnectionContext,
+                          transp: MobileTransport,
+                          frame: MobileFrame): Future[void] {.async.} =
+  ## ASSETS_GET_BY_IDS (28). Ported from assets.py.
+  if not await requireLoggedIn(ctx, transp, frame, AssetsGetByIdsOpcode):
+    return
+  let payload =
+    try:
+      unpackMapPayload(frame.payload, OnemeAssetsGetByIdsPayload)
+    except MsgPackCodecError:
+      await transp.sendErrorResponse(frame, AssetsGetByIdsOpcode, invalidPayloadError())
+      return
+  let response =
+    if payload.`type` == "STICKER_SET":
+      %*{"stickerSets": []}
+    else:
+      %*{"stickers": []}
+  await transp.sendResponseBytes(frame, CmdOk, AssetsGetByIdsOpcode, packJsonPayload(response))
+
+proc handleAssetsAck(ctx: ConnectionContext,
+                     transp: MobileTransport,
+                     frame: MobileFrame,
+                     opcode: uint16): Future[void] {.async.} =
+  ## ASSETS_ADD / REMOVE / MOVE / LIST_MODIFY: acknowledge with empty payload.
+  ## Ported from assets.py — these mutate client-side favourites which this
+  ## server does not persist yet, so the reference returns `{}`.
+  if not await requireLoggedIn(ctx, transp, frame, opcode):
+    return
+  await transp.sendResponseBytes(frame, CmdOk, opcode, packJsonPayload(newJObject()))
+
+proc handleFoldersUpdate(ctx: ConnectionContext,
+                         transp: MobileTransport,
+                         frame: MobileFrame): Future[void] {.async.} =
+  ## FOLDERS_UPDATE (274): create/update a chat folder. Ported from folders.py.
+  if not await requireLoggedIn(ctx, transp, frame, FoldersUpdateOpcode):
+    return
+
+  let payload =
+    try:
+      unpackJsonPayload(frame.payload)
+    except MsgPackCodecError:
+      await transp.sendErrorResponse(frame, FoldersUpdateOpcode, invalidPayloadError())
+      return
+
+  let id = payload{"id"}.getStr("")
+  let title = payload{"title"}.getStr("")
+  if id.len == 0 or title.len == 0:
+    await transp.sendErrorResponse(frame, FoldersUpdateOpcode, invalidPayloadError())
+    return
+
+  let filters = payload.jsonArrayOrEmpty("filters")
+  let includeArr = payload.jsonArrayOrEmpty("include")
+  let updateTime = nowUnixMs()
+  let phone = normalizePhone(ctx.currentPhone)
+  let sortOrder = ctx.app.db.nextFolderSortOrder(phone)
+
+  ctx.app.db.upsertFolder(id, phone, title, $filters, $includeArr, updateTime, sortOrder)
+
+  let order = ctx.app.db.folderOrder(phone)
+  var orderJson = newJArray()
+  for fid in order: orderJson.add %fid
+
+  let response = %*{
+    "folder": {
+      "id": id,
+      "title": title,
+      "include": includeArr,
+      "filters": filters,
+      "updateTime": updateTime,
+      "options": [],
+      "sourceId": 1
+    },
+    "folderSync": updateTime,
+    "foldersOrder": orderJson
+  }
+  await transp.sendResponseBytes(frame, CmdOk, FoldersUpdateOpcode, packJsonPayload(response))
+
+  # The reference server also pushes a config-hash notification afterwards.
+  await transp.sendResponseBytes(frame, 0'u8, NotifConfigOpcode,
+    packJsonPayload(%*{"config": {"hash": "0"}}))
+
+proc handleContactAddByPhone(ctx: ConnectionContext,
+                             transp: MobileTransport,
+                             frame: MobileFrame): Future[void] {.async.} =
+  ## CONTACT_ADD_BY_PHONE (41). Ported from contacts.py.
+  if not await requireLoggedIn(ctx, transp, frame, ContactCreateOpcode):
+    return
+
+  let payload =
+    try:
+      unpackMapPayload(frame.payload, OnemeContactAddByPhonePayload)
+    except MsgPackCodecError:
+      await transp.sendErrorResponse(frame, ContactCreateOpcode, invalidPayloadError())
+      return
+
+  let phone = normalizePhoneNumber(payload.phone)
+  if phone.len == 0 or payload.firstName.len == 0:
+    await transp.sendErrorResponse(frame, ContactCreateOpcode, invalidPayloadError())
+    return
+
+  let user = ctx.app.db.findUserByPhone(phone)
+  if user.len == 0:
+    await transp.sendErrorResponse(frame, ContactCreateOpcode, userNotFoundError())
+    return
+
+  let contactId = rowInt64(user, "id")
+  let isNew = ctx.app.db.findContact(ctx.currentUserId, contactId).len == 0
+  if isNew:
+    ctx.app.db.addContactFull(ctx.currentUserId, contactId, payload.firstName, payload.lastName, false)
+    let chatId = if contactId == ctx.currentUserId: ctx.currentUserId else: ctx.currentUserId xor contactId
+    if contactId == ctx.currentUserId:
+      ctx.app.db.ensureChat(chatId, ctx.currentUserId, "DIALOG", [ctx.currentUserId])
+    else:
+      ctx.app.db.ensureChat(chatId, ctx.currentUserId, "DIALOG", [ctx.currentUserId, contactId])
+
+  let contact = generateOnemeProfileJson(
+    user, ctx.app.config.service_urls.avatar_base_url,
+    includeProfileOptions = false,
+    customFirstName = payload.firstName,
+    customLastName = payload.lastName
+  )
+  await transp.sendResponseBytes(frame, CmdOk, ContactCreateOpcode,
+    packJsonPayload(%*{"new": isNew, "contact": contact}))
+
+proc presenceForUser(ctx: ConnectionContext, userId: int64, nowS: int64): JsonNode =
+  ## Mirror Python tools.collect_presence using connected transports as the
+  ## online signal (Nim has no separate clients status map).
+  if ctx.app.transportsForUser(userId).len > 0:
+    %*{"seen": nowS, "status": 2}
+  else:
+    let last = ctx.app.db.lastSeenForUser(userId)
+    %*{"seen": last}
+
+proc handleContactPresence(ctx: ConnectionContext,
+                           transp: MobileTransport,
+                           frame: MobileFrame): Future[void] {.async.} =
+  ## CONTACT_PRESENCE (35). Ported from contacts.py::contact_presence.
+  if not await requireLoggedIn(ctx, transp, frame, ContactPresenceOpcode):
+    return
+
+  let payload =
+    try:
+      unpackMapPayload(frame.payload, OnemeContactPresencePayload)
+    except MsgPackCodecError:
+      await transp.sendErrorResponse(frame, ContactPresenceOpcode, invalidPayloadError())
+      return
+
+  let nowS = store.nowUnix()
+  var presence = newJObject()
+  for contactId in payload.contactIds:
+    presence[$contactId] = presenceForUser(ctx, contactId, nowS)
+
+  await transp.sendResponseBytes(frame, CmdOk, ContactPresenceOpcode,
+    packJsonPayload(%*{"presence": presence, "time": nowUnixMs()}))
+
+proc handleChatSubscribe(ctx: ConnectionContext,
+                         transp: MobileTransport,
+                         frame: MobileFrame): Future[void] {.async.} =
+  ## CHAT_SUBSCRIBE (75). Ported from chats.py — validate then ack with nil.
+  if not await requireLoggedIn(ctx, transp, frame, ChatSubscribeOpcode):
+    return
+  if frame.payload.len > 0:
+    try:
+      discard unpackMapPayload(frame.payload, OnemeChatSubscribePayload)
+    except MsgPackCodecError:
+      await transp.sendErrorResponse(frame, ChatSubscribeOpcode, invalidPayloadError())
+      return
+  await transp.sendNilResponse(frame, CmdOk, ChatSubscribeOpcode)
+
+proc handleComplainReasonsGet(ctx: ConnectionContext,
+                              transp: MobileTransport,
+                              frame: MobileFrame): Future[void] {.async.} =
+  ## COMPLAIN_REASONS_GET (162). Ported from complaints.py.
+  if not await requireLoggedIn(ctx, transp, frame, ComplainReasonsGetOpcode):
+    return
+  let response = %*{
+    "complains": parseJson(ComplainReasonsJson),
+    "complainSync": store.nowUnix()
+  }
+  await transp.sendResponseBytes(frame, CmdOk, ComplainReasonsGetOpcode, packJsonPayload(response))
+
+proc handleVideoChatHistory(ctx: ConnectionContext,
+                            transp: MobileTransport,
+                            frame: MobileFrame): Future[void] {.async.} =
+  ## VIDEO_CHAT_HISTORY (79). Ported from calls.py — empty history stub.
+  if not await requireLoggedIn(ctx, transp, frame, VideoChatHistoryOpcode):
+    return
+  let response = %*{
+    "hasMore": false,
+    "history": [],
+    "backwardMarker": 0,
+    "forwardMarker": 0
+  }
+  await transp.sendResponseBytes(frame, CmdOk, VideoChatHistoryOpcode, packJsonPayload(response))
 
 proc handleTcpFrame*(ctx: ConnectionContext,
                      transp: MobileTransport,
@@ -1302,8 +1697,36 @@ proc handleTcpFrame*(ctx: ConnectionContext,
     await handleSessionsInfo(ctx, transp, frame)
   of ConfigOpcode:
     await handleConfig(ctx, transp, frame)
+  of ProfileOpcode:
+    await handleProfile(ctx, transp, frame)
   of FoldersGetOpcode:
-    await handleFoldersGet(transp, frame)
+    await handleFoldersGet(ctx, transp, frame)
+  of FoldersUpdateOpcode:
+    await handleFoldersUpdate(ctx, transp, frame)
+  of AssetsUpdateOpcode:
+    await handleAssetsUpdate(ctx, transp, frame)
+  of AssetsGetOpcode:
+    await handleAssetsGet(ctx, transp, frame)
+  of AssetsGetByIdsOpcode:
+    await handleAssetsGetByIds(ctx, transp, frame)
+  of AssetsAddOpcode:
+    await handleAssetsAck(ctx, transp, frame, AssetsAddOpcode)
+  of AssetsRemoveOpcode:
+    await handleAssetsAck(ctx, transp, frame, AssetsRemoveOpcode)
+  of AssetsMoveOpcode:
+    await handleAssetsAck(ctx, transp, frame, AssetsMoveOpcode)
+  of AssetsListModifyOpcode:
+    await handleAssetsAck(ctx, transp, frame, AssetsListModifyOpcode)
+  of ContactCreateOpcode:
+    await handleContactAddByPhone(ctx, transp, frame)
+  of ContactPresenceOpcode:
+    await handleContactPresence(ctx, transp, frame)
+  of ChatSubscribeOpcode:
+    await handleChatSubscribe(ctx, transp, frame)
+  of ComplainReasonsGetOpcode:
+    await handleComplainReasonsGet(ctx, transp, frame)
+  of VideoChatHistoryOpcode:
+    await handleVideoChatHistory(ctx, transp, frame)
   of ChatsListOpcode:
     await handleChatsList(ctx, transp, frame)
   of ChatInfoOpcode:

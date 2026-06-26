@@ -379,3 +379,150 @@ proc createTamtamUser*(db: AppDatabase,
   db.insertUserData(phone)
   db.insertDefaultFolder(phone)
   db.findUserById(userId)
+
+# ---------------------------------------------------------------------------
+# Folders (ported from Python oneme/processors/folders.py)
+# ---------------------------------------------------------------------------
+
+proc foldersForPhone*(db: AppDatabase, phone: string): seq[DbRow] =
+  db.sqlite.queryAll(
+    "SELECT id, title, filters, `include`, options, update_time, source_id " &
+    "FROM user_folders WHERE phone = ? ORDER BY sort_order",
+    [textValue(phone)]
+  )
+
+proc nextFolderSortOrder*(db: AppDatabase, phone: string): int64 =
+  let row = db.sqlite.queryRow(
+    "SELECT COALESCE(MAX(sort_order), -1) AS max_order FROM user_folders WHERE phone = ?",
+    [textValue(phone)]
+  )
+  dbRowString(row, "max_order").parseBiggestInt().int64 + 1
+
+proc upsertFolder*(db: AppDatabase,
+                   id, phone, title, filtersJson, includeJson: string,
+                   updateTimeMs, sortOrder: int64) =
+  ## Insert a new folder or update the existing one (matches Python: id+phone key).
+  if db.sqlite.queryRow(
+    "SELECT id FROM user_folders WHERE id = ? AND phone = ? LIMIT 1",
+    [textValue(id), textValue(phone)]
+  ).len == 0:
+    db.sqlite.exec(
+      "INSERT INTO user_folders (id, phone, title, filters, `include`, options, source_id, update_time, sort_order) " &
+      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      [
+        textValue(id), textValue(phone), textValue(title),
+        textValue(filtersJson), textValue(includeJson), textValue("[]"),
+        intValue(1), intValue(updateTimeMs), intValue(sortOrder)
+      ]
+    )
+  else:
+    db.sqlite.exec(
+      "UPDATE user_folders SET title = ?, filters = ?, `include` = ?, update_time = ? " &
+      "WHERE id = ? AND phone = ?",
+      [
+        textValue(title), textValue(filtersJson), textValue(includeJson),
+        intValue(updateTimeMs), textValue(id), textValue(phone)
+      ]
+    )
+
+proc folderOrder*(db: AppDatabase, phone: string): seq[string] =
+  for row in db.sqlite.queryAll(
+    "SELECT id FROM user_folders WHERE phone = ? ORDER BY sort_order",
+    [textValue(phone)]
+  ):
+    result.add dbRowString(row, "id")
+
+# ---------------------------------------------------------------------------
+# Contacts: blocking, custom names, lookups (ported from contacts.py / search.py)
+# ---------------------------------------------------------------------------
+
+proc findContact*(db: AppDatabase, ownerId, contactId: int64): DbRow =
+  db.sqlite.queryRow(
+    "SELECT * FROM contacts WHERE owner_id = ? AND contact_id = ? LIMIT 1",
+    [intValue(ownerId), intValue(contactId)]
+  )
+
+proc addContactFull*(db: AppDatabase,
+                     ownerId, contactId: int64,
+                     firstName, lastName: string,
+                     blocked: bool) =
+  db.sqlite.exec(
+    "INSERT OR IGNORE INTO contacts (owner_id, contact_id, custom_firstname, custom_lastname, is_blocked) " &
+    "VALUES (?, ?, ?, ?, ?)",
+    [
+      intValue(ownerId), intValue(contactId),
+      (if firstName.len > 0: textValue(firstName) else: nullValue()),
+      (if lastName.len > 0: textValue(lastName) else: nullValue()),
+      intValue(if blocked: 1 else: 0)
+    ]
+  )
+
+proc updateContactNames*(db: AppDatabase,
+                         ownerId, contactId: int64,
+                         firstName, lastName: string) =
+  db.sqlite.exec(
+    "UPDATE contacts SET custom_firstname = ?, custom_lastname = ? WHERE owner_id = ? AND contact_id = ?",
+    [
+      (if firstName.len > 0: textValue(firstName) else: nullValue()),
+      (if lastName.len > 0: textValue(lastName) else: nullValue()),
+      intValue(ownerId), intValue(contactId)
+    ]
+  )
+
+proc setContactBlocked*(db: AppDatabase, ownerId, contactId: int64, blocked: bool) =
+  db.sqlite.exec(
+    "UPDATE contacts SET is_blocked = ? WHERE owner_id = ? AND contact_id = ?",
+    [intValue(if blocked: 1 else: 0), intValue(ownerId), intValue(contactId)]
+  )
+
+proc blockedContactsForUser*(db: AppDatabase, ownerId: int64, count: int): seq[DbRow] =
+  if count > 0:
+    db.sqlite.queryAll(
+      "SELECT * FROM contacts WHERE owner_id = ? AND is_blocked = 1 LIMIT ?",
+      [intValue(ownerId), intValue(count.int64)]
+    )
+  else:
+    db.sqlite.queryAll(
+      "SELECT * FROM contacts WHERE owner_id = ? AND is_blocked = 1",
+      [intValue(ownerId)]
+    )
+
+proc contactIsBlocked*(db: AppDatabase, ownerId, contactId: int64): bool =
+  ## True when `ownerId` has blocked `contactId` (mirrors Python tools.contact_is_blocked).
+  let row = db.findContact(ownerId, contactId)
+  row.len != 0 and dbRowString(row, "is_blocked") in ["1", "TRUE", "true"]
+
+proc lastSeenForUser*(db: AppDatabase, userId: int64): int64 =
+  let row = db.sqlite.queryRow(
+    "SELECT lastseen FROM users WHERE id = ? LIMIT 1",
+    [intValue(userId)]
+  )
+  if row.len == 0:
+    0'i64
+  else:
+    let v = dbRowString(row, "lastseen")
+    if v.len == 0: 0'i64
+    else:
+      try: parseBiggestInt(v).int64
+      except ValueError: 0'i64
+
+proc updateLastSeen*(db: AppDatabase, userId, secs: int64) =
+  db.sqlite.exec(
+    "UPDATE users SET lastseen = ? WHERE id = ?",
+    [textValue($secs), intValue(userId)]
+  )
+
+proc contactOwnersOf*(db: AppDatabase, contactId: int64): seq[int64] =
+  ## Everyone who has `contactId` in their contact list (for presence broadcast).
+  for row in db.sqlite.queryAll(
+    "SELECT owner_id FROM contacts WHERE contact_id = ?",
+    [intValue(contactId)]
+  ):
+    result.add dbRowString(row, "owner_id").parseBiggestInt().int64
+
+proc updateUserConfig*(db: AppDatabase, phone, userConfigJson: string) =
+  ## Persist the merged per-user privacy config (ported from main.py update_config).
+  db.sqlite.exec(
+    "UPDATE user_data SET user_config = ? WHERE phone = ?",
+    [textValue(userConfigJson), textValue(phone)]
+  )

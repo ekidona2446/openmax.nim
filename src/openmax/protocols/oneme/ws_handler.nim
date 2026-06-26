@@ -10,11 +10,14 @@ import ../../db/store
 import ../../db/sqlite_abi
 import ../auth_utils
 import ../errors
+import ../profile_payloads
+import ../static_data
 
 type
   WsConnectionState = ref object
     currentUserId: int64
     currentSessionToken: string
+    currentPhone: string
 
 proc safeInfo(message: string) =
   try:
@@ -117,7 +120,7 @@ proc handleAuthRequest(app: AppContext, ws: WSSession, req: JsonNode): Future[vo
   let state = if existingUser.len == 0: "register" else: ""
   let authToken = generateRandomString(96)
   let verifyCode = generateCode()
-  app.db.insertAuthToken(phone, authToken, verifyCode, nowUnix() + 300, state)
+  app.db.insertAuthToken(phone, authToken, verifyCode, store.nowUnix() + 300, state)
 
   await ws.sendOk(req, AuthRequestOpcode.int, %*{
     "token": authToken,
@@ -212,6 +215,7 @@ proc handleLogin(app: AppContext, ws: WSSession, req: JsonNode, state: WsConnect
 
   state.currentUserId = rowInt64(user, "id")
   state.currentSessionToken = token
+  state.currentPhone = rowString(session, "phone")
   await ws.sendOk(req, LoginOpcode.int, %*{
     "profile": profileJson(user),
     "token": token,
@@ -225,7 +229,143 @@ proc handleLogout(app: AppContext, ws: WSSession, req: JsonNode, state: WsConnec
     app.db.deleteSessionToken(state.currentSessionToken)
   state.currentUserId = 0
   state.currentSessionToken = ""
+  state.currentPhone = ""
   await ws.sendOk(req, LogoutOpcode.int, newJNull())
+
+# ---------------------------------------------------------------------------
+# Newly ported opcodes (parity with the TCP handler / Python websocket.py).
+# ---------------------------------------------------------------------------
+
+proc wsRequireUser(ws: WSSession, req: JsonNode, opcode: int, state: WsConnectionState): Future[bool] {.async.} =
+  if state.currentUserId == 0:
+    await ws.sendErr(req, opcode, invalidTokenError())
+    return false
+  true
+
+proc handleProfileWs(app: AppContext, ws: WSSession, req: JsonNode, state: WsConnectionState): Future[void] {.async.} =
+  if not await wsRequireUser(ws, req, ProfileOpcode.int, state): return
+  let user = app.db.findUserById(state.currentUserId)
+  if user.len == 0:
+    await ws.sendErr(req, ProfileOpcode.int, userNotFoundError())
+    return
+  let profile = generateOnemeProfileJson(user, app.config.service_urls.avatar_base_url, includeProfileOptions = true)
+  await ws.sendOk(req, ProfileOpcode.int, %*{"profile": profile})
+
+proc handleAssetsUpdateWs(app: AppContext, ws: WSSession, req: JsonNode, state: WsConnectionState): Future[void] {.async.} =
+  if not await wsRequireUser(ws, req, AssetsUpdateOpcode.int, state): return
+  await ws.sendOk(req, AssetsUpdateOpcode.int, %*{
+    "sync": nowUnixMs(),
+    "stickerSetsUpdates": newJObject(),
+    "stickersUpdates": newJObject(),
+    "stickersOrder": ["RECENT", "FAVORITE_STICKERS", "FAVORITE_STICKER_SETS", "TOP", "NEW", "NEW_STICKER_SETS"],
+    "sections": [
+      {"id": "RECENT", "type": "RECENTS", "recentsList": []},
+      {"id": "FAVORITE_STICKERS", "type": "STICKERS", "stickers": [], "marker": newJNull()},
+      {"id": "FAVORITE_STICKER_SETS", "type": "STICKER_SETS", "stickerSets": [], "marker": newJNull()},
+      {"id": "TOP", "type": "STICKERS", "stickers": [], "marker": newJNull()},
+      {"id": "NEW", "type": "STICKERS", "stickers": [], "marker": newJNull()},
+      {"id": "NEW_STICKER_SETS", "type": "STICKER_SETS", "stickerSets": [], "marker": newJNull()}
+    ]
+  })
+
+proc handleAssetsGetWs(app: AppContext, ws: WSSession, req: JsonNode, state: WsConnectionState): Future[void] {.async.} =
+  if not await wsRequireUser(ws, req, AssetsGetOpcode.int, state): return
+  let p = reqPayload(req)
+  let response =
+    if p{"type"}.getStr("") == "STICKER_SET": %*{"stickerSets": [], "marker": newJNull()}
+    else: %*{"stickers": [], "marker": newJNull()}
+  await ws.sendOk(req, AssetsGetOpcode.int, response)
+
+proc handleAssetsGetByIdsWs(app: AppContext, ws: WSSession, req: JsonNode, state: WsConnectionState): Future[void] {.async.} =
+  if not await wsRequireUser(ws, req, AssetsGetByIdsOpcode.int, state): return
+  let p = reqPayload(req)
+  let response =
+    if p{"type"}.getStr("") == "STICKER_SET": %*{"stickerSets": []}
+    else: %*{"stickers": []}
+  await ws.sendOk(req, AssetsGetByIdsOpcode.int, response)
+
+proc handleAssetsAckWs(app: AppContext, ws: WSSession, req: JsonNode, opcode: int, state: WsConnectionState): Future[void] {.async.} =
+  if not await wsRequireUser(ws, req, opcode, state): return
+  await ws.sendOk(req, opcode, newJObject())
+
+proc handleFoldersGetWs(app: AppContext, ws: WSSession, req: JsonNode, state: WsConnectionState): Future[void] {.async.} =
+  if not await wsRequireUser(ws, req, FoldersGetOpcode.int, state): return
+  let phone = normalizePhone(state.currentPhone)
+  var folders = newJArray()
+  var order = newJArray()
+  for row in app.db.foldersForPhone(phone):
+    let id = rowString(row, "id")
+    folders.add %*{
+      "id": id,
+      "title": rowString(row, "title"),
+      "filters": (try: parseJson(rowString(row, "filters")) except CatchableError: newJArray()),
+      "include": (try: parseJson(rowString(row, "include")) except CatchableError: newJArray()),
+      "updateTime": rowInt64(row, "update_time"),
+      "options": (try: parseJson(rowString(row, "options")) except CatchableError: newJArray()),
+      "sourceId": rowInt64(row, "source_id").int
+    }
+    order.add %id
+  await ws.sendOk(req, FoldersGetOpcode.int, %*{
+    "folderSync": nowUnixMs(),
+    "folders": folders,
+    "foldersOrder": order,
+    "allFilterExcludeFolders": []
+  })
+
+proc handleFoldersUpdateWs(app: AppContext, ws: WSSession, req: JsonNode, state: WsConnectionState): Future[void] {.async.} =
+  if not await wsRequireUser(ws, req, FoldersUpdateOpcode.int, state): return
+  let p = reqPayload(req)
+  let id = p{"id"}.getStr("")
+  let title = p{"title"}.getStr("")
+  if id.len == 0 or title.len == 0:
+    await ws.sendErr(req, FoldersUpdateOpcode.int, invalidPayloadError())
+    return
+  let filters = (if p.hasKey("filters") and p["filters"].kind == JArray: p["filters"] else: newJArray())
+  let includeArr = (if p.hasKey("include") and p["include"].kind == JArray: p["include"] else: newJArray())
+  let updateTime = nowUnixMs()
+  let phone = normalizePhone(state.currentPhone)
+  let sortOrder = app.db.nextFolderSortOrder(phone)
+  app.db.upsertFolder(id, phone, title, $filters, $includeArr, updateTime, sortOrder)
+  var orderJson = newJArray()
+  for fid in app.db.folderOrder(phone): orderJson.add %fid
+  await ws.sendOk(req, FoldersUpdateOpcode.int, %*{
+    "folder": {"id": id, "title": title, "include": includeArr, "filters": filters,
+               "updateTime": updateTime, "options": [], "sourceId": 1},
+    "folderSync": updateTime,
+    "foldersOrder": orderJson
+  })
+  await ws.sendFrame(req, 0, NotifConfigOpcode.int, %*{"config": {"hash": "0"}})
+
+proc handleContactPresenceWs(app: AppContext, ws: WSSession, req: JsonNode, state: WsConnectionState): Future[void] {.async.} =
+  if not await wsRequireUser(ws, req, ContactPresenceOpcode.int, state): return
+  let p = reqPayload(req)
+  let nowS = store.nowUnix()
+  var presence = newJObject()
+  if p.hasKey("contactIds") and p["contactIds"].kind == JArray:
+    for idNode in p["contactIds"]:
+      let uid = idNode.getBiggestInt().int64
+      if app.transportsForUser(uid).len > 0:
+        presence[$uid] = %*{"seen": nowS, "status": 2}
+      else:
+        presence[$uid] = %*{"seen": app.db.lastSeenForUser(uid)}
+  await ws.sendOk(req, ContactPresenceOpcode.int, %*{"presence": presence, "time": nowUnixMs()})
+
+proc handleComplainReasonsGetWs(app: AppContext, ws: WSSession, req: JsonNode, state: WsConnectionState): Future[void] {.async.} =
+  if not await wsRequireUser(ws, req, ComplainReasonsGetOpcode.int, state): return
+  await ws.sendOk(req, ComplainReasonsGetOpcode.int, %*{
+    "complains": parseJson(ComplainReasonsJson),
+    "complainSync": store.nowUnix()
+  })
+
+proc handleVideoChatHistoryWs(app: AppContext, ws: WSSession, req: JsonNode, state: WsConnectionState): Future[void] {.async.} =
+  if not await wsRequireUser(ws, req, VideoChatHistoryOpcode.int, state): return
+  await ws.sendOk(req, VideoChatHistoryOpcode.int, %*{
+    "hasMore": false, "history": [], "backwardMarker": 0, "forwardMarker": 0
+  })
+
+proc handleChatSubscribeWs(app: AppContext, ws: WSSession, req: JsonNode, state: WsConnectionState): Future[void] {.async.} =
+  if not await wsRequireUser(ws, req, ChatSubscribeOpcode.int, state): return
+  await ws.sendOk(req, ChatSubscribeOpcode.int, newJNull())
 
 proc handleCallsToken(app: AppContext, ws: WSSession, req: JsonNode, currentUserId: int64): Future[void] {.async.} =
   if currentUserId == 0:
@@ -258,6 +398,34 @@ proc handleWsFrame(app: AppContext, ws: WSSession, req: JsonNode, state: WsConne
     await handleLogout(app, ws, req, state)
   of CallsTokenOpcode:
     await handleCallsToken(app, ws, req, state.currentUserId)
+  of ProfileOpcode:
+    await handleProfileWs(app, ws, req, state)
+  of AssetsUpdateOpcode:
+    await handleAssetsUpdateWs(app, ws, req, state)
+  of AssetsGetOpcode:
+    await handleAssetsGetWs(app, ws, req, state)
+  of AssetsGetByIdsOpcode:
+    await handleAssetsGetByIdsWs(app, ws, req, state)
+  of AssetsAddOpcode:
+    await handleAssetsAckWs(app, ws, req, AssetsAddOpcode.int, state)
+  of AssetsRemoveOpcode:
+    await handleAssetsAckWs(app, ws, req, AssetsRemoveOpcode.int, state)
+  of AssetsMoveOpcode:
+    await handleAssetsAckWs(app, ws, req, AssetsMoveOpcode.int, state)
+  of AssetsListModifyOpcode:
+    await handleAssetsAckWs(app, ws, req, AssetsListModifyOpcode.int, state)
+  of FoldersGetOpcode:
+    await handleFoldersGetWs(app, ws, req, state)
+  of FoldersUpdateOpcode:
+    await handleFoldersUpdateWs(app, ws, req, state)
+  of ContactPresenceOpcode:
+    await handleContactPresenceWs(app, ws, req, state)
+  of ComplainReasonsGetOpcode:
+    await handleComplainReasonsGetWs(app, ws, req, state)
+  of VideoChatHistoryOpcode:
+    await handleVideoChatHistoryWs(app, ws, req, state)
+  of ChatSubscribeOpcode:
+    await handleChatSubscribeWs(app, ws, req, state)
   else:
     await ws.sendErr(req, opcode, notImplementedError())
 
