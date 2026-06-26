@@ -3,6 +3,7 @@ import chronos
 import msgpack4nim
 import ../../core/connection_context
 import ../../core/app_context
+import ../../core/calls_state
 import ../../core/opcodes
 import ../../crypto/sha256
 import ../../db/store
@@ -1160,6 +1161,7 @@ proc handleCallsToken(ctx: ConnectionContext,
   # implementation will validate this token later; for now it encodes enough
   # local identity for localhost federation experiments.
   let callToken = "openmax-call:" & $ctx.currentUserId & ":" & generateRandomString(64)
+  ctx.app.calls.registerCallToken(callToken, ctx.currentUserId)
   await transp.sendResponseObject(
     frame,
     CmdOk,

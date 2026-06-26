@@ -13,7 +13,9 @@ import ../protocols/router
 import ../protocols/oneme/ws_handler
 import ../protocols/tamtam/ws_handler
 import ../protocols/calls_http
+import ../protocols/calls/signaling_ws
 import ../protocols/uploads_http
+import std/uri as stduri
 
 type
   ListenerRuntime* = ref object
@@ -166,12 +168,32 @@ proc serveTcp(runtime: ListenerRuntime): Future[void] {.async: (raises: []).} =
     runtime.server.close()
     await noCancel(runtime.server.join())
 
+proc queryValue(query, key: string): string =
+  for part in query.split('&'):
+    if part.len == 0: continue
+    let eq = part.find('=')
+    let k = if eq >= 0: part[0 ..< eq] else: part
+    if k == key:
+      return if eq >= 0: stduri.decodeUrl(part[eq + 1 .. ^1]) else: ""
+  ""
+
+proc isSignalingPath(runtime: ListenerRuntime, path: string): bool =
+  runtime.app.callsEnabled() and path == runtime.app.callsSignalingPath()
+
 proc handleWebSocketRequest(runtime: ListenerRuntime, request: HttpRequest, peer: string): Future[void] {.async.} =
   try:
+    let signaling = runtime.isSignalingPath(request.uri.path)
+    let conversationId = if signaling: queryValue(request.uri.query, "conversationId") else: ""
+    let signalingToken = if signaling: queryValue(request.uri.query, "token") else: ""
+
     let server = WSServer.new()
     let ws = await server.handleRequest(request)
     if ws.readyState != ReadyState.Open:
       safeWarn(&"[transport] websocket upgrade failed: {runtime.spec.describe()} peer={peer}")
+      return
+
+    if signaling:
+      await runtime.app.handleSignalingWebSocket(ws, conversationId, signalingToken, peer)
       return
 
     case runtime.spec.protocol

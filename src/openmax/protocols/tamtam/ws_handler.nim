@@ -2,6 +2,7 @@ import std/[json, strutils, strformat, logging, tables]
 import chronos
 import websock/websock
 import ../../core/app_context
+import ../../core/calls_state
 import ../../core/opcodes
 import ../../proto/mobile_rpc
 import ../../crypto/sha256
@@ -271,12 +272,14 @@ proc handleLogout(app: AppContext, ws: WSSession, req: JsonNode, state: WsConnec
   state.currentSessionToken = ""
   await ws.sendOk(req, LogoutOpcode.int, newJNull())
 
-proc handleCallsToken(ws: WSSession, req: JsonNode, currentUserId: int64): Future[void] {.async.} =
+proc handleCallsToken(app: AppContext, ws: WSSession, req: JsonNode, currentUserId: int64): Future[void] {.async.} =
   if currentUserId == 0:
     await ws.sendErr(req, OkTokenOpcode.int, invalidTokenError())
     return
+  let token = "openmax-call:" & $currentUserId & ":" & generateRandomString(64)
+  app.calls.registerCallToken(token, currentUserId)
   await ws.sendOk(req, OkTokenOpcode.int, %*{
-    "token": "openmax-call:" & $currentUserId & ":" & generateRandomString(64)
+    "token": token
   })
 
 proc handleWsFrame(app: AppContext, ws: WSSession, req: JsonNode, state: WsConnectionState, peer: string): Future[void] {.async.} =
@@ -299,7 +302,7 @@ proc handleWsFrame(app: AppContext, ws: WSSession, req: JsonNode, state: WsConne
   of LogoutOpcode:
     await handleLogout(app, ws, req, state)
   of OkTokenOpcode:
-    await handleCallsToken(ws, req, state.currentUserId)
+    await handleCallsToken(app, ws, req, state.currentUserId)
   else:
     await ws.sendErr(req, opcode, notImplementedError())
 

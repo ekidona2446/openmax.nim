@@ -34,6 +34,22 @@ type
     tamtam_ws_enabled*: bool
     tamtam_ws_port*: int
 
+  CallsConfig* = object
+    ## Calls API + Signaling configuration.
+    ## The server only signals; actual media relay is delegated to an external
+    ## coturn deployment whose addresses are advertised here verbatim.
+    enabled*: bool
+    application_key*: string          ## key clients must present to /fb.do
+    signaling_host*: string           ## host advertised in the wss endpoint (empty -> server.host)
+    signaling_port*: int              ## port advertised in the wss endpoint (0 -> first oneme ws port)
+    signaling_path*: string           ## path of the signaling websocket (default /websocket)
+    turn_urls*: seq[string]           ## e.g. ["turn:turn.example.su:3478"]
+    turn_username*: string
+    turn_credential*: string
+    stun_urls*: seq[string]           ## e.g. ["stun:stun.example.su:3478"]
+    session_ttl_seconds*: int         ## how long an anonymLogin session stays valid
+    token_ttl_seconds*: int           ## how long an OneMe call-token stays valid
+
   IntegrationsConfig* = object
     telegram_enabled*: bool
     telegram_token*: string
@@ -49,4 +65,5 @@ type
     database*: DatabaseConfig
     service_urls*: ServiceUrlsConfig
     protocols*: ProtocolsConfig
+    calls*: CallsConfig
     integrations*: IntegrationsConfig
